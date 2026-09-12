@@ -1,0 +1,1188 @@
+"""Core spectrum I/O and analysis primitives.
+
+The algorithms are intended for teaching and exploratory analysis. They are
+not validated for safety decisions, regulatory reporting, or certified
+radionuclide quantification.
+"""
+
+from __future__ import annotations
+
+import csv
+import json
+import math
+import os
+import re
+import xml.etree.ElementTree as ET
+import zipfile
+from dataclasses import dataclass, field
+from pathlib import Path, PurePosixPath
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+
+if hasattr(np, "trapezoid"):
+    _trapz = np.trapezoid
+else:  # pragma: no cover - NumPy < 2 compatibility
+    _trapz = np.trapz
+
+XLSX_MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+XLSX_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+XLSX_PKG_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+SPECTRUM_FILE_FILTER = (
+    "支持的谱文件 (*.spe *.Spe *.SPE *.xlsx *.XLSX *.csv *.CSV *.txt *.TXT);;"
+    "Canberra SPE (*.spe *.Spe *.SPE);;"
+    "Excel 工作簿 (*.xlsx *.XLSX);;"
+    "文本数据 (*.csv *.CSV *.txt *.TXT);;"
+    "所有文件 (*.*)"
+)
+CHANNEL_HEADER_KEYWORDS = (
+    "channel",
+    "channels",
+    "chan",
+    "index",
+    "道址",
+    "通道",
+    "道号",
+    "序号",
+    "编号",
+)
+COUNT_HEADER_KEYWORDS = (
+    "count",
+    "counts",
+    "计数",
+    "强度",
+    "intensity",
+    "value",
+    "y",
+)
+REAL_TIME_HEADER_KEYWORDS = (
+    "realtime",
+    "real",
+    "实时间",
+    "实时",
+)
+LIVE_TIME_HEADER_KEYWORDS = (
+    "livetime",
+    "live",
+    "活时间",
+    "死时间",
+)
+
+NNDC_LIBRARY: Dict[str, List[Dict[str, float]]] = {
+  "co-60": [
+    {"energy": 1173.237, "intensity": 0.999},
+    {"energy": 1332.501, "intensity": 0.999}
+  ],
+  "cs-137": [
+    {"energy": 661.657, "intensity": 0.851}
+  ],
+  "co-57":[{"energy":14.413,"intensity":0.0916},
+           {"energy":122.061,"intensity":0.8560},
+           {"energy":136.474,"intensity":0.1068}
+           ],
+  "ba-133": [
+    {"energy": 80.997, "intensity": 0.342},
+    {"energy": 276.398, "intensity": 0.0716},
+    {"energy": 302.853, "intensity": 0.1834},
+    {"energy": 356.017, "intensity": 0.622},
+    {"energy": 383.851, "intensity": 0.0894}
+  ],
+  "na-22": [
+    {"energy": 1274.537, "intensity": 0.999}
+  ],
+  "am-241": [
+    {"energy": 59.541, "intensity": 0.359}
+  ],
+  "eu-152": [
+    {"energy": 121.782, "intensity": 0.284},
+    {"energy": 244.697, "intensity": 0.0755},
+    {"energy": 344.278, "intensity": 0.265},
+    {"energy": 778.903, "intensity": 0.1297},
+    {"energy": 964.055, "intensity": 0.145},
+    {"energy": 1112.116, "intensity": 0.1341},
+    {"energy": 1408.006, "intensity": 0.2087}
+  ],
+  "k-40": [
+    {"energy": 1460.822, "intensity": 0.1066}
+  ],
+  "mn-54": [
+    {"energy": 834.848, "intensity": 0.9998}
+  ],
+  "y-88": [
+    {"energy": 898.042, "intensity": 0.937},
+    {"energy": 1836.063, "intensity": 0.9936}
+  ],
+  "bi-207": [
+    {"energy": 569.698, "intensity": 0.977},
+    {"energy": 1063.656, "intensity": 0.745}
+  ],
+  "hg-203": [
+    {"energy": 279.195, "intensity": 0.815}
+  ],
+  "cd-109": [
+    {"energy": 88.034, "intensity": 0.036}
+  ],
+  "i-131": [
+    {"energy": 364.489, "intensity": 0.817}
+  ],
+  "ce-139": [
+    {"energy": 165.857, "intensity": 0.799}
+  ],
+  "ru-106": [
+    {"energy": 621.900, "intensity": 0.098}
+  ],
+  "sr-85": [
+    {"energy": 514.007, "intensity": 0.984}
+  ],
+  "zn-65": [
+    {"energy": 1115.546, "intensity": 0.506}
+  ]
+}
+
+
+def validate_nuclide_library(payload: object) -> Dict[str, List[Dict[str, float]]]:
+    """Validate and normalize a nuclide reference library mapping."""
+
+    if not isinstance(payload, dict) or not payload:
+        raise ValueError("核素库必须是非空对象，键为核素名称，值为参考线列表。")
+    normalized: Dict[str, List[Dict[str, float]]] = {}
+    for raw_name, raw_lines in payload.items():
+        name = str(raw_name).strip()
+        if not name:
+            raise ValueError("核素名称不能为空。")
+        if not isinstance(raw_lines, list) or not raw_lines:
+            raise ValueError(f"核素 {name} 必须至少包含一条参考线。")
+        lines: List[Dict[str, float]] = []
+        for index, raw_line in enumerate(raw_lines, 1):
+            if not isinstance(raw_line, dict):
+                raise ValueError(f"核素 {name} 的第 {index} 条参考线格式错误。")
+            energy_value = raw_line.get("energy", raw_line.get("energy_kev"))
+            intensity_value = raw_line.get("intensity", raw_line.get("emission_probability"))
+            try:
+                energy = float(energy_value)
+                intensity = float(intensity_value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"核素 {name} 的第 {index} 条参考线缺少有效数值。") from exc
+            if not math.isfinite(energy) or energy <= 0:
+                raise ValueError(f"核素 {name} 的参考能量必须为正有限值。")
+            if not math.isfinite(intensity) or intensity <= 0:
+                raise ValueError(f"核素 {name} 的发射概率必须为正有限值。")
+            lines.append({"energy": energy, "intensity": intensity})
+        normalized[name] = sorted(lines, key=lambda item: item["energy"])
+    return normalized
+
+
+def load_nuclide_library(filepath: str) -> Dict[str, List[Dict[str, float]]]:
+    """Load a reference library from JSON or a three-column CSV file."""
+
+    path = Path(filepath)
+    suffix = path.suffix.lower()
+    if suffix == ".json":
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"无法读取核素库 JSON：{exc}") from exc
+        return validate_nuclide_library(payload)
+    if suffix != ".csv":
+        raise ValueError("核素库仅支持 JSON 或 CSV 文件。")
+
+    text: Optional[str] = None
+    for encoding in ("utf-8-sig", "gb18030"):
+        try:
+            text = path.read_text(encoding=encoding)
+            break
+        except UnicodeDecodeError:
+            continue
+        except OSError as exc:
+            raise ValueError(f"无法读取核素库 CSV：{exc}") from exc
+    if text is None:
+        raise ValueError("核素库 CSV 编码无法识别，请使用 UTF-8 或 GB18030。")
+
+    reader = csv.DictReader(text.splitlines())
+    if not reader.fieldnames:
+        raise ValueError("核素库 CSV 缺少表头。")
+    headers = {name.strip().lower(): name for name in reader.fieldnames if name}
+
+    def resolve_header(*aliases: str) -> Optional[str]:
+        return next((headers[alias] for alias in aliases if alias in headers), None)
+
+    isotope_header = resolve_header("nuclide", "isotope", "核素")
+    energy_header = resolve_header("energy_kev", "energy", "能量", "能量(kev)")
+    intensity_header = resolve_header("intensity", "emission_probability", "发射概率", "强度")
+    if not isotope_header or not energy_header or not intensity_header:
+        raise ValueError("核素库 CSV 需要 nuclide、energy_kev、intensity 三列。")
+    payload: Dict[str, List[Dict[str, object]]] = {}
+    for row_index, row in enumerate(reader, 2):
+        name = str(row.get(isotope_header, "")).strip()
+        if not name:
+            raise ValueError(f"核素库 CSV 第 {row_index} 行缺少核素名称。")
+        payload.setdefault(name, []).append(
+            {
+                "energy": row.get(energy_header),
+                "intensity": row.get(intensity_header),
+            }
+        )
+    return validate_nuclide_library(payload)
+
+
+@dataclass
+class SpectrumRecord:
+    filepath: str
+    channels: np.ndarray
+    counts: np.ndarray
+    real_time: Optional[float] = None
+    live_time: Optional[float] = None
+    warnings: List[str] = field(default_factory=list)
+
+
+@dataclass
+class PeakResult:
+    channel: float
+    fwhm: float
+    area: float
+    snr: float
+    energy: float = 0.0
+    nuclide_candidates: List[str] = field(default_factory=list)
+    confidence: float = 0.0
+    primary_isotope: str = ""
+    reference_intensity: float = 0.0
+    activity_bq: Optional[float] = None
+
+    def as_row(self) -> List[str]:
+        activity = format_activity(self.activity_bq)
+        return [
+            f"{self.channel:.1f}",
+            f"{self.energy:.2f}",
+            f"{self.area:.1f}",
+            f"{self.fwhm:.2f}",
+            ", ".join(self.nuclide_candidates) if self.nuclide_candidates else "—",
+            f"{self.confidence * 100:.1f}%",
+            activity,
+        ]
+
+
+@dataclass
+class EfficiencyPoint:
+    energy: float
+    efficiency: float
+    peak_channel: float
+    peak_area: float
+    counts_per_second: float
+    intensity: float
+    nuclide: str
+
+
+@dataclass
+class ActivitySummary:
+    isotope: str
+    activity_bq: float
+    peak_count: int
+
+
+@dataclass
+class NuclideMatchSummary:
+    isotope: str
+    matched_lines: int
+    total_lines: int
+    intensity_coverage: float
+    match_score: float
+
+
+@dataclass
+class AnalysisResult:
+    baseline: np.ndarray
+    net_counts: np.ndarray
+    peaks: List[PeakResult]
+    nuclide_summary: List[NuclideMatchSummary] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class AnalysisConfig:
+    """Tunable parameters for detector- and spectrum-specific analysis."""
+
+    snip_iterations: Optional[int] = None
+    wavelet_widths: Tuple[int, ...] = (2, 4, 6, 8, 10, 12)
+    detection_threshold_sigma: float = 1.0
+    min_peak_distance: int = 6
+    min_snr: float = 1.25
+    absolute_tolerance_kev: float = 0.5
+    relative_tolerance: float = 0.002
+    max_candidates: int = 3
+
+    def validated(self) -> "AnalysisConfig":
+        if self.snip_iterations is not None and not 1 <= int(self.snip_iterations) <= 4096:
+            raise ValueError("SNIP 迭代次数必须在 1 到 4096 之间。")
+        if not self.wavelet_widths or any(int(value) < 1 or int(value) > 256 for value in self.wavelet_widths):
+            raise ValueError("小波宽度必须是 1 到 256 之间的正整数。")
+        if not math.isfinite(self.detection_threshold_sigma) or self.detection_threshold_sigma < 0:
+            raise ValueError("寻峰阈值系数必须是非负有限值。")
+        if int(self.min_peak_distance) < 1:
+            raise ValueError("最小峰间距必须至少为 1 个通道。")
+        if not math.isfinite(self.min_snr) or self.min_snr < 0:
+            raise ValueError("最小信噪比必须是非负有限值。")
+        if not math.isfinite(self.absolute_tolerance_kev) or self.absolute_tolerance_kev <= 0:
+            raise ValueError("绝对匹配容差必须是正有限值。")
+        if not math.isfinite(self.relative_tolerance) or self.relative_tolerance < 0:
+            raise ValueError("相对匹配容差必须是非负有限值。")
+        if not 1 <= int(self.max_candidates) <= 20:
+            raise ValueError("候选核素数量必须在 1 到 20 之间。")
+        return self
+
+    def as_dict(self) -> Dict[str, object]:
+        return {
+            "snip_iterations": self.snip_iterations,
+            "wavelet_widths": list(self.wavelet_widths),
+            "detection_threshold_sigma": self.detection_threshold_sigma,
+            "min_peak_distance": self.min_peak_distance,
+            "min_snr": self.min_snr,
+            "absolute_tolerance_kev": self.absolute_tolerance_kev,
+            "relative_tolerance": self.relative_tolerance,
+            "max_candidates": self.max_candidates,
+        }
+
+
+def format_activity(activity: Optional[float]) -> str:
+    if activity is None or activity <= 0:
+        return "—"
+    if activity >= 1e9:
+        return f"{activity / 1e9:.3f} GBq"
+    if activity >= 1e6:
+        return f"{activity / 1e6:.3f} MBq"
+    if activity >= 1e3:
+        return f"{activity / 1e3:.3f} kBq"
+    return f"{activity:.2f} Bq"
+
+
+class CalibrationModel:
+    def __init__(self, coefficients: Optional[List[float]] = None) -> None:
+        self.coefficients = coefficients or [1.0, 0.0]
+
+    def energy(self, channel: float) -> float:
+        degree = len(self.coefficients) - 1
+        value = 0.0
+        for idx, coef in enumerate(self.coefficients):
+            power = degree - idx
+            value += coef * (channel ** power)
+        return value
+
+    def describe(self) -> str:
+        terms = []
+        degree = len(self.coefficients) - 1
+        for idx, coef in enumerate(self.coefficients):
+            power = degree - idx
+            if power == 0:
+                terms.append(f"{coef:.6f}")
+            elif power == 1:
+                terms.append(f"{coef:.6f}·x")
+            else:
+                terms.append(f"{coef:.6f}·x^{power}")
+        return " + ".join(terms)
+
+    def is_default(self) -> bool:
+        return (
+            len(self.coefficients) == 2
+            and abs(self.coefficients[0] - 1.0) < 1e-9
+            and abs(self.coefficients[1]) < 1e-9
+        )
+
+
+def fit_energy_calibration(
+    channels: List[float] | np.ndarray,
+    energies: List[float] | np.ndarray,
+    degree: int = 1,
+) -> Tuple[CalibrationModel, float]:
+    """Fit E(channel) and return the model plus RMSE in keV."""
+
+    x = np.asarray(channels, dtype=float)
+    y = np.asarray(energies, dtype=float)
+    if x.ndim != 1 or y.ndim != 1 or len(x) != len(y):
+        raise ValueError("刻度通道与能量必须是一维且长度一致。")
+    if len(x) < 2:
+        raise ValueError("能量刻度至少需要 2 个峰。")
+    if not np.all(np.isfinite(x)) or not np.all(np.isfinite(y)):
+        raise ValueError("刻度点包含 NaN 或无穷值。")
+    if len(np.unique(x)) != len(x):
+        raise ValueError("刻度通道不能重复。")
+    degree = int(degree)
+    if degree < 1 or degree >= len(x):
+        raise ValueError(f"{len(x)} 个刻度点仅支持 1 到 {len(x) - 1} 阶拟合。")
+    coefficients = np.polyfit(x, y, degree)
+    predicted = np.polyval(coefficients, x)
+    rmse = float(np.sqrt(np.mean((predicted - y) ** 2)))
+    return CalibrationModel([float(value) for value in coefficients]), rmse
+
+
+class EfficiencyModel:
+    """对 ln(ε) 与 ln(E) 做多项式拟合的效率刻度模型。"""
+
+    def __init__(
+        self,
+        coefficients: Optional[List[float]] = None,
+        energy_bounds: Optional[Tuple[float, float]] = None,
+    ) -> None:
+        self.coefficients = coefficients or []
+        self.energy_bounds = energy_bounds
+
+    def is_valid(self) -> bool:
+        return bool(self.coefficients)
+
+    def set_energy_bounds(self, energies: List[float]) -> None:
+        valid = [value for value in energies if value > 0]
+        if not valid:
+            self.energy_bounds = None
+            return
+        low = min(valid)
+        high = max(valid)
+        if math.isclose(low, high):
+            margin = max(5.0, low * 0.05)
+        else:
+            span = max(high - low, 1.0)
+            margin = max(5.0, span * 0.05)
+        self.energy_bounds = (max(1e-3, low - margin), high + margin)
+
+    def within_domain(self, energy: float) -> bool:
+        if energy <= 0:
+            return False
+        if not self.energy_bounds:
+            return True
+        low, high = self.energy_bounds
+        return low <= energy <= high
+
+    def efficiency(self, energy: float) -> float:
+        if not self.coefficients or energy <= 0 or not self.within_domain(energy):
+            return 0.0
+        log_energy = math.log(energy)
+        log_eff = 0.0
+        degree = len(self.coefficients) - 1
+        for idx, coef in enumerate(self.coefficients):
+            power = degree - idx
+            log_eff += coef * (log_energy ** power)
+        return math.exp(log_eff)
+
+    def describe(self) -> str:
+        if not self.coefficients:
+            return "未刻度"
+        terms = []
+        degree = len(self.coefficients) - 1
+        for idx, coef in enumerate(self.coefficients):
+            power = degree - idx
+            if power == 0:
+                terms.append(f"{coef:.6f}")
+            elif power == 1:
+                terms.append(f"{coef:.6f}·lnE")
+            else:
+                terms.append(f"{coef:.6f}·lnE^{power}")
+        return "lnε = " + " + ".join(terms)
+
+
+def _validated_record(record: SpectrumRecord) -> SpectrumRecord:
+    """Normalize arrays and reject data that would make analysis misleading."""
+
+    channels = np.asarray(record.channels, dtype=float)
+    counts = np.asarray(record.counts, dtype=float)
+    if channels.ndim != 1 or counts.ndim != 1 or len(channels) != len(counts):
+        raise ValueError("通道与计数必须是一维且长度一致。")
+    if len(channels) < 4:
+        raise ValueError("谱数据点不足，至少需要 4 个通道。")
+    if not np.all(np.isfinite(channels)) or not np.all(np.isfinite(counts)):
+        raise ValueError("谱数据包含 NaN 或无穷值。")
+    if np.any(counts < 0):
+        raise ValueError("谱计数不能为负数。")
+    order = np.argsort(channels)
+    channels = channels[order]
+    counts = counts[order]
+    if np.any(np.diff(channels) <= 0):
+        raise ValueError("通道编号必须严格递增且不能重复。")
+    return SpectrumRecord(
+        filepath=record.filepath,
+        channels=channels,
+        counts=counts,
+        real_time=record.real_time,
+        live_time=record.live_time,
+        warnings=list(record.warnings),
+    )
+
+
+def parse_spe_file(filepath: str) -> SpectrumRecord:
+    counts: List[float] = []
+    start_channel = 0
+    end_channel: Optional[int] = None
+    expected_channels: Optional[int] = None
+    reading_data = False
+    pending_tag: Optional[str] = None
+    real_time = live_time = None
+
+    with open(filepath, "r", encoding="utf-8-sig", errors="ignore") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            if reading_data and not line.startswith("$"):
+                try:
+                    counts.append(float(line))
+                except ValueError:
+                    continue
+                continue
+
+            if pending_tag == "$DATA_RANGE" and not line.startswith("$"):
+                parts = line.replace(",", " ").split()
+                try:
+                    if len(parts) < 2:
+                        raise ValueError
+                    start_channel = int(float(parts[0]))
+                    end_channel = int(float(parts[1]))
+                except ValueError as exc:
+                    raise ValueError("SPE 的 $DATA 区间无效。") from exc
+                if end_channel < start_channel:
+                    raise ValueError("SPE 的 $DATA 结束通道小于起始通道。")
+                expected_channels = end_channel - start_channel + 1
+                pending_tag = None
+                reading_data = True
+                continue
+
+            if pending_tag == "$MEAS_TIM" and not line.startswith("$"):
+                values = line.replace(",", " ").split()
+                try:
+                    if len(values) >= 2:
+                        # SPE convention: live time first, real time second.
+                        live_time = float(values[0])
+                        real_time = float(values[1])
+                except ValueError:
+                    pass
+                pending_tag = None
+                continue
+
+            if line.startswith("$"):
+                reading_data = False
+                tag, _, payload = line.partition(":")
+                upper_tag = tag.upper()
+                if upper_tag.startswith("$DATA"):
+                    parts = payload.replace(",", " ").split()
+                    if len(parts) >= 2:
+                        try:
+                            start_channel = int(float(parts[0]))
+                            end_channel = int(float(parts[1]))
+                        except ValueError as exc:
+                            raise ValueError("SPE 的 $DATA 区间无效。") from exc
+                        if end_channel < start_channel:
+                            raise ValueError("SPE 的 $DATA 结束通道小于起始通道。")
+                        expected_channels = end_channel - start_channel + 1
+                        reading_data = True
+                        pending_tag = None
+                    else:
+                        pending_tag = "$DATA_RANGE"
+                elif upper_tag.startswith("$MEAS_TIM"):
+                    values = payload.replace(",", " ").split()
+                    if len(values) >= 2:
+                        try:
+                            live_time = float(values[0])
+                            real_time = float(values[1])
+                        except ValueError:
+                            pass
+                        pending_tag = None
+                    else:
+                        pending_tag = "$MEAS_TIM"
+                else:
+                    pending_tag = None
+                continue
+
+    warnings: List[str] = []
+    if expected_channels is not None and len(counts) != expected_channels:
+        exclusive_count = (end_channel - start_channel) if end_channel is not None else -1
+        if len(counts) == exclusive_count:
+            warnings.append(
+                "SPE 的 $DATA 结束值按上界解释；文件实际点数比闭区间声明少 1。"
+            )
+        else:
+            raise ValueError(
+                f"SPE 数据长度不匹配：闭区间声明 {expected_channels} 个通道，实际读取 {len(counts)} 个。"
+            )
+    if not counts:
+        raise ValueError("SPE 文件中未找到有效计数数据。")
+
+    channels = np.arange(start_channel, start_channel + len(counts))
+    return _validated_record(SpectrumRecord(
+        filepath=filepath,
+        channels=channels,
+        counts=np.asarray(counts, dtype=float),
+        real_time=real_time,
+        live_time=live_time,
+        warnings=warnings,
+    ))
+
+
+def _normalize_header_label(value: object) -> str:
+    text = str(value or "").strip().lower()
+    return re.sub(r"[\s_\-:/\\()\[\]{}（）【】]+", "", text)
+
+
+def _safe_float(value: object) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        result = float(value)
+        return result if math.isfinite(result) else None
+    text = str(value).strip()
+    if not text:
+        return None
+    text = text.replace(",", "")
+    try:
+        result = float(text)
+    except ValueError:
+        return None
+    return result if math.isfinite(result) else None
+
+
+def _header_matches(label: object, keywords: Tuple[str, ...]) -> bool:
+    normalized = _normalize_header_label(label)
+    return bool(normalized) and any(keyword in normalized for keyword in keywords)
+
+
+def _xlsx_column_to_index(cell_ref: str) -> int:
+    letters = "".join(ch for ch in cell_ref if ch.isalpha()).upper()
+    index = 0
+    for ch in letters:
+        index = index * 26 + (ord(ch) - ord("A") + 1)
+    return max(index - 1, 0)
+
+
+def _xlsx_inline_text(cell: ET.Element) -> str:
+    parts = [node.text or "" for node in cell.findall(f".//{{{XLSX_MAIN_NS}}}t")]
+    return "".join(parts).strip()
+
+
+def _read_xlsx_shared_strings(workbook: zipfile.ZipFile) -> List[str]:
+    path = "xl/sharedStrings.xml"
+    if path not in workbook.namelist():
+        return []
+    root = ET.fromstring(workbook.read(path))
+    values: List[str] = []
+    for item in root.findall(f".//{{{XLSX_MAIN_NS}}}si"):
+        parts = [node.text or "" for node in item.findall(f".//{{{XLSX_MAIN_NS}}}t")]
+        values.append("".join(parts))
+    return values
+
+
+def _resolve_xlsx_target(base_path: str, target: str) -> str:
+    if target.startswith("/"):
+        return target.lstrip("/")
+    return str(PurePosixPath(base_path).parent.joinpath(target))
+
+
+def _read_xlsx_sheet_rows(workbook: zipfile.ZipFile, sheet_path: str, shared_strings: List[str]) -> List[Dict[int, str]]:
+    root = ET.fromstring(workbook.read(sheet_path))
+    rows: List[Dict[int, str]] = []
+    for row in root.findall(f".//{{{XLSX_MAIN_NS}}}sheetData/{{{XLSX_MAIN_NS}}}row"):
+        values: Dict[int, str] = {}
+        for cell in row.findall(f"{{{XLSX_MAIN_NS}}}c"):
+            ref = cell.get("r", "")
+            column = _xlsx_column_to_index(ref)
+            cell_type = cell.get("t", "")
+            if cell_type == "inlineStr":
+                text = _xlsx_inline_text(cell)
+            else:
+                raw_value = cell.findtext(f"{{{XLSX_MAIN_NS}}}v", default="")
+                if cell_type == "s":
+                    index = int(raw_value) if raw_value.isdigit() else -1
+                    text = shared_strings[index] if 0 <= index < len(shared_strings) else ""
+                elif cell_type == "b":
+                    text = "1" if raw_value == "1" else "0"
+                else:
+                    text = raw_value
+            if str(text).strip():
+                values[column] = str(text).strip()
+        rows.append(values)
+    return rows
+
+
+def _extract_time_from_row(row_values: List[object]) -> Tuple[Optional[float], Optional[float]]:
+    real_time = None
+    live_time = None
+    for idx in range(len(row_values) - 1):
+        label = row_values[idx]
+        value = _safe_float(row_values[idx + 1])
+        if value is None:
+            continue
+        if real_time is None and _header_matches(label, REAL_TIME_HEADER_KEYWORDS):
+            real_time = value
+        if live_time is None and _header_matches(label, LIVE_TIME_HEADER_KEYWORDS):
+            live_time = value
+    return real_time, live_time
+
+
+def _best_numeric_run(rows: List[Dict[int, str]], counts_col: int, channel_col: Optional[int]) -> Tuple[int, int]:
+    best_start = -1
+    best_length = 0
+    current_start = -1
+    current_length = 0
+    for idx, row in enumerate(rows):
+        count_value = _safe_float(row.get(counts_col))
+        channel_value = _safe_float(row.get(channel_col)) if channel_col is not None else None
+        valid = count_value is not None and (channel_col is None or channel_value is not None)
+        if valid:
+            if current_start < 0:
+                current_start = idx
+                current_length = 0
+            current_length += 1
+        else:
+            if current_length > best_length:
+                best_start = current_start
+                best_length = current_length
+            current_start = -1
+            current_length = 0
+    if current_length > best_length:
+        best_start = current_start
+        best_length = current_length
+    return best_start, best_length
+
+
+def _parse_xlsx_sheet(filepath: str, sheet_name: str, rows: List[Dict[int, str]]) -> Optional[SpectrumRecord]:
+    if not rows:
+        return None
+
+    header_row_index = -1
+    counts_col: Optional[int] = None
+    channel_col: Optional[int] = None
+    real_time_col: Optional[int] = None
+    live_time_col: Optional[int] = None
+    real_time: Optional[float] = None
+    live_time: Optional[float] = None
+
+    for idx, row in enumerate(rows[:20]):
+        ordered_values = [row[key] for key in sorted(row)]
+        row_real, row_live = _extract_time_from_row(ordered_values)
+        if real_time is None and row_real is not None:
+            real_time = row_real
+        if live_time is None and row_live is not None:
+            live_time = row_live
+        if header_row_index >= 0:
+            continue
+        if not row:
+            continue
+        if any(_header_matches(value, COUNT_HEADER_KEYWORDS) for value in row.values()):
+            header_row_index = idx
+        elif any(_header_matches(value, CHANNEL_HEADER_KEYWORDS) for value in row.values()):
+            header_row_index = idx
+        if header_row_index >= 0:
+            for column, value in row.items():
+                if counts_col is None and _header_matches(value, COUNT_HEADER_KEYWORDS):
+                    counts_col = column
+                if channel_col is None and _header_matches(value, CHANNEL_HEADER_KEYWORDS):
+                    channel_col = column
+                if real_time_col is None and _header_matches(value, REAL_TIME_HEADER_KEYWORDS):
+                    real_time_col = column
+                if live_time_col is None and _header_matches(value, LIVE_TIME_HEADER_KEYWORDS):
+                    live_time_col = column
+
+    numeric_counts: Dict[int, int] = {}
+    for row in rows[max(header_row_index + 1, 0):]:
+        for column, value in row.items():
+            if _safe_float(value) is not None:
+                numeric_counts[column] = numeric_counts.get(column, 0) + 1
+
+    ranked_numeric_columns = [column for column, _ in sorted(numeric_counts.items(), key=lambda item: (-item[1], item[0]))]
+    numeric_columns = [column for column, _ in sorted(numeric_counts.items(), key=lambda item: item[0])]
+    preferred_numeric_columns = sorted(ranked_numeric_columns[:2])
+    if counts_col is None:
+        if len(preferred_numeric_columns) == 1:
+            counts_col = preferred_numeric_columns[0]
+        elif len(preferred_numeric_columns) >= 2:
+            channel_col = preferred_numeric_columns[0] if channel_col is None else channel_col
+            counts_col = preferred_numeric_columns[1]
+        elif len(numeric_columns) == 1:
+            counts_col = numeric_columns[0]
+        elif len(numeric_columns) >= 2:
+            channel_col = numeric_columns[0] if channel_col is None else channel_col
+            counts_col = numeric_columns[1]
+    elif channel_col is None and numeric_columns:
+        for column in numeric_columns:
+            if column != counts_col:
+                channel_col = column
+                break
+
+    if counts_col is None:
+        return None
+
+    start_index = max(header_row_index + 1, 0)
+    run_start, run_length = _best_numeric_run(rows[start_index:], counts_col, channel_col)
+    if run_start < 0 or run_length < 4:
+        return None
+    run_start += start_index
+    run_end = run_start + run_length
+
+    channels: List[float] = []
+    counts: List[float] = []
+    for row in rows[run_start:run_end]:
+        count_value = _safe_float(row.get(counts_col))
+        if count_value is None:
+            continue
+        channel_value = _safe_float(row.get(channel_col)) if channel_col is not None else None
+        if channel_col is not None and channel_value is None:
+            continue
+        counts.append(count_value)
+        if channel_value is None:
+            channels.append(float(len(channels)))
+        else:
+            channels.append(channel_value)
+        if real_time is None and real_time_col is not None:
+            real_time = _safe_float(row.get(real_time_col))
+        if live_time is None and live_time_col is not None:
+            live_time = _safe_float(row.get(live_time_col))
+
+    if len(counts) < 4:
+        return None
+
+    channel_array = np.asarray(channels, dtype=float)
+    counts_array = np.asarray(counts, dtype=float)
+    order = np.argsort(channel_array)
+    channel_array = channel_array[order]
+    counts_array = counts_array[order]
+    if len(channel_array) >= 2 and np.any(np.diff(channel_array) <= 0):
+        channel_array = np.arange(len(counts_array), dtype=float)
+
+    return _validated_record(SpectrumRecord(
+        filepath=filepath,
+        channels=channel_array,
+        counts=counts_array,
+        real_time=real_time,
+        live_time=live_time,
+    ))
+
+
+def parse_xlsx_file(filepath: str) -> SpectrumRecord:
+    try:
+        with zipfile.ZipFile(filepath, "r") as workbook:
+            shared_strings = _read_xlsx_shared_strings(workbook)
+            workbook_root = ET.fromstring(workbook.read("xl/workbook.xml"))
+            rel_root = ET.fromstring(workbook.read("xl/_rels/workbook.xml.rels"))
+            rel_map = {
+                rel.get("Id", ""): _resolve_xlsx_target("xl/workbook.xml", rel.get("Target", ""))
+                for rel in rel_root.findall(f".//{{{XLSX_PKG_REL_NS}}}Relationship")
+            }
+
+            for sheet in workbook_root.findall(f".//{{{XLSX_MAIN_NS}}}sheet"):
+                rel_id = sheet.get(f"{{{XLSX_REL_NS}}}id", "")
+                sheet_name = sheet.get("name", "Sheet1")
+                sheet_path = rel_map.get(rel_id)
+                if not sheet_path or sheet_path not in workbook.namelist():
+                    continue
+                rows = _read_xlsx_sheet_rows(workbook, sheet_path, shared_strings)
+                parsed = _parse_xlsx_sheet(filepath, sheet_name, rows)
+                if parsed is not None:
+                    return parsed
+    except (OSError, KeyError, ET.ParseError, zipfile.BadZipFile) as exc:
+        raise ValueError(f"无法读取 Excel 文件: {exc}") from exc
+    raise ValueError("Excel 文件中未找到可识别的光谱数据。")
+
+
+def parse_delimited_file(filepath: str) -> SpectrumRecord:
+    """Read a UTF-8/GB18030 CSV or tab-delimited channel-count file."""
+
+    raw: Optional[str] = None
+    for encoding in ("utf-8-sig", "gb18030"):
+        try:
+            raw = Path(filepath).read_text(encoding=encoding)
+            break
+        except UnicodeDecodeError:
+            continue
+        except OSError as exc:
+            raise ValueError(f"无法读取文本谱文件: {exc}") from exc
+    if raw is None:
+        raise ValueError("文本谱文件编码无法识别，请使用 UTF-8 或 GB18030。")
+
+    lines = [line for line in raw.splitlines() if line.strip()]
+    if not lines:
+        raise ValueError("文本谱文件为空。")
+    try:
+        dialect = csv.Sniffer().sniff("\n".join(lines[:20]), delimiters=",;\t")
+        rows_raw = list(csv.reader(lines, dialect))
+    except csv.Error:
+        rows_raw = [re.split(r"[,;\t\s]+", line.strip()) for line in lines]
+
+    rows = [
+        {index: value.strip() for index, value in enumerate(row) if value.strip()}
+        for row in rows_raw
+    ]
+    parsed = _parse_xlsx_sheet(filepath, Path(filepath).stem, rows)
+    if parsed is None:
+        raise ValueError("文本文件中未找到可识别的通道-计数数据。")
+    return parsed
+
+
+def load_spectrum_file(filepath: str) -> SpectrumRecord:
+    extension = os.path.splitext(filepath)[1].lower()
+    if extension == ".spe":
+        return parse_spe_file(filepath)
+    if extension == ".xlsx":
+        return parse_xlsx_file(filepath)
+    if extension in {".csv", ".txt"}:
+        return parse_delimited_file(filepath)
+    raise ValueError("暂不支持该文件类型，请选择 SPE、XLSX、CSV 或 TXT 文件。")
+
+
+def snip_baseline(counts: np.ndarray, iterations: Optional[int] = None) -> np.ndarray:
+    spec = np.log(np.clip(counts, 1, None))
+    baseline = spec.copy()
+    length = len(spec)
+    max_iter = iterations or max(16, min(length // 2, 80))
+    for k in range(1, max_iter):
+        left = np.roll(baseline, k)
+        right = np.roll(baseline, -k)
+        avg = 0.5 * (left + right)
+        avg[:k] = baseline[:k]
+        avg[-k:] = baseline[-k:]
+        baseline = np.minimum(baseline, avg)
+    return np.exp(baseline)
+
+
+def smooth_spectrum(counts: np.ndarray, window: int = 7) -> np.ndarray:
+    size = max(3, int(window))
+    if size % 2 == 0:
+        size += 1
+    if len(counts) <= 2:
+        return np.asarray(counts, dtype=float).copy()
+    radius = min(size // 2, max(len(counts) // 2, 1))
+    x = np.arange(-radius, radius + 1, dtype=float)
+    sigma = max(radius / 2.0, 1.0)
+    kernel = np.exp(-(x ** 2) / (2.0 * sigma ** 2))
+    kernel /= np.sum(kernel)
+    padded = np.pad(np.asarray(counts, dtype=float), (radius, radius), mode="edge")
+    return np.convolve(padded, kernel, mode="valid")
+
+
+def mexican_hat_wavelet(width: float) -> np.ndarray:
+    width = max(width, 1.0)
+    half = int(4 * width)
+    x = np.arange(-half, half + 1)
+    sigma = width
+    norm = 2 / (math.sqrt(3 * sigma) * (math.pi ** 0.25))
+    wave = norm * (1 - (x ** 2) / (sigma ** 2)) * np.exp(-(x ** 2) / (2 * sigma ** 2))
+    wave -= wave.mean()
+    return wave
+
+
+def continuous_wavelet_transform(counts: np.ndarray, widths: List[int]) -> np.ndarray:
+    responses = []
+    for width in widths:
+        kernel = mexican_hat_wavelet(float(width))
+        conv = np.convolve(counts, kernel, mode="same")
+        responses.append(conv)
+    return np.asarray(responses)
+
+
+def detect_peaks_from_cwt(
+    net_counts: np.ndarray,
+    widths: Optional[List[int] | Tuple[int, ...]] = None,
+    min_distance: int = 6,
+    threshold_sigma: float = 1.0,
+) -> List[int]:
+    net_counts = np.asarray(net_counts, dtype=float)
+    if net_counts.ndim != 1 or len(net_counts) < 3:
+        return []
+    if not np.all(np.isfinite(net_counts)):
+        raise ValueError("寻峰输入包含 NaN 或无穷值。")
+    if widths is None:
+        widths = sorted({2, 4, 6, 8, 10, 12})
+    cwt_matrix = continuous_wavelet_transform(net_counts, widths)
+    aggregate = np.max(cwt_matrix, axis=0)
+    threshold = aggregate.mean() + float(threshold_sigma) * aggregate.std()
+    candidates: List[int] = []
+    last_idx = -min_distance
+    for idx in range(1, len(aggregate) - 1):
+        if aggregate[idx] > threshold and aggregate[idx] >= aggregate[idx - 1] and aggregate[idx] >= aggregate[idx + 1]:
+            if idx - last_idx < min_distance:
+                if aggregate[idx] > aggregate[last_idx]:
+                    candidates[-1] = idx
+                    last_idx = idx
+                continue
+            candidates.append(idx)
+            last_idx = idx
+    return candidates
+
+
+def refine_peaks(
+    channels: np.ndarray,
+    net_counts: np.ndarray,
+    raw_counts: np.ndarray,
+    candidates: List[int],
+    window: int = 20,
+    min_snr: float = 1.25,
+) -> List[PeakResult]:
+    peaks: List[PeakResult] = []
+    for center in candidates:
+        left = max(0, center - window)
+        right = min(len(net_counts), center + window + 1)
+        segment = net_counts[left:right]
+        if len(segment) < 5 or np.max(segment) <= 0:
+            continue
+        x = channels[left:right]
+        baseline = max(segment[0], segment[-1])
+        y = np.clip(segment - baseline, 0, None)
+        if np.sum(y) <= 0:
+            continue
+        mu = float(np.sum(x * y) / np.sum(y))
+        variance = float(np.sum(y * (x - mu) ** 2) / np.sum(y))
+        sigma = math.sqrt(max(variance, 1e-6))
+        amplitude = float(np.max(y))
+        fwhm = 2.3548 * sigma
+        reconstructed = amplitude * np.exp(-((x - mu) ** 2) / (2 * sigma ** 2))
+        residual = math.sqrt(np.mean((y - reconstructed) ** 2))
+        snr = amplitude / max(residual, 1e-6)
+        if snr < min_snr:
+            continue
+        area = float(_trapz(y, x))
+        peaks.append(PeakResult(channel=mu, fwhm=fwhm, area=area, snr=snr))
+    return peaks
+
+
+def flatten_library(library: Dict[str, List[Dict[str, float]]]) -> List[Dict[str, float]]:
+    flat: List[Dict[str, float]] = []
+    for isotope, lines in library.items():
+        for line in lines:
+            entry = dict(line)
+            entry["isotope"] = isotope
+            flat.append(entry)
+    return flat
+
+
+def match_nuclides(
+    peaks: List[PeakResult],
+    calibration: CalibrationModel,
+    library: List[Dict[str, float]],
+    absolute_tolerance_kev: float = 0.5,
+    relative_tolerance: float = 0.002,
+    max_candidates: int = 3,
+) -> None:
+    if not peaks:
+        return
+    for peak in peaks:
+        energy = calibration.energy(peak.channel)
+        peak.energy = energy
+        peak.primary_isotope = ""
+        peak.reference_intensity = 0.0
+        tolerance = max(float(absolute_tolerance_kev), energy * float(relative_tolerance))
+        matches = []
+        for entry in library:
+            diff = abs(entry["energy"] - energy)
+            if diff <= tolerance:
+                intensity = entry.get("intensity", 0.0)
+                norm_diff = diff / tolerance
+                matches.append((norm_diff, -intensity, entry, intensity))
+        matches.sort(key=lambda item: (item[0], item[1]))
+        peak.nuclide_candidates = [
+            f"{entry['isotope']} ({entry['energy']:.1f} keV)"
+            for _, __, entry, ___ in matches[: int(max_candidates)]
+        ]
+        if matches:
+            norm_diff, _, entry, intensity = matches[0]
+            peak.primary_isotope = str(entry.get("isotope", ""))
+            peak.reference_intensity = float(intensity)
+            confidence = max(0.0, 1.0 - norm_diff)
+            confidence *= 0.6 + 0.4 * min(max(intensity, 0.0), 1.0)
+            peak.confidence = min(confidence, 1.0)
+        else:
+            peak.confidence = 0.0
+
+
+def summarize_nuclide_matches(
+    peaks: List[PeakResult],
+    library: Dict[str, List[Dict[str, float]]],
+    absolute_tolerance_kev: float = 0.5,
+    relative_tolerance: float = 0.002,
+) -> List[NuclideMatchSummary]:
+    """Rank spectrum-level candidates using unique line coverage and energy agreement."""
+
+    summaries: List[NuclideMatchSummary] = []
+    for isotope, lines in validate_nuclide_library(library).items():
+        total_intensity = sum(float(line["intensity"]) for line in lines)
+        matched_intensity = 0.0
+        weighted_quality = 0.0
+        matched_lines = 0
+        used_peak_indexes: set[int] = set()
+        for line in sorted(lines, key=lambda item: float(item["intensity"]), reverse=True):
+            reference_energy = float(line["energy"])
+            tolerance = max(float(absolute_tolerance_kev), reference_energy * float(relative_tolerance))
+            candidates = [
+                (abs(peak.energy - reference_energy), index)
+                for index, peak in enumerate(peaks)
+                if index not in used_peak_indexes and peak.energy > 0
+            ]
+            if not candidates:
+                continue
+            difference, peak_index = min(candidates)
+            if difference > tolerance:
+                continue
+            intensity = float(line["intensity"])
+            used_peak_indexes.add(peak_index)
+            matched_lines += 1
+            matched_intensity += intensity
+            weighted_quality += intensity * max(0.0, 1.0 - difference / tolerance)
+        if not matched_lines or total_intensity <= 0:
+            continue
+        coverage = min(matched_intensity / total_intensity, 1.0)
+        quality = weighted_quality / matched_intensity if matched_intensity > 0 else 0.0
+        score = coverage * (0.7 + 0.3 * quality)
+        summaries.append(
+            NuclideMatchSummary(
+                isotope=isotope,
+                matched_lines=matched_lines,
+                total_lines=len(lines),
+                intensity_coverage=coverage,
+                match_score=min(max(score, 0.0), 1.0),
+            )
+        )
+    return sorted(
+        summaries,
+        key=lambda item: (item.match_score, item.matched_lines, item.intensity_coverage),
+        reverse=True,
+    )
+
+
+def analyze_spectrum(
+    record: SpectrumRecord,
+    calibration: Optional[CalibrationModel] = None,
+    library: Optional[Dict[str, List[Dict[str, float]]]] = None,
+    config: Optional[AnalysisConfig] = None,
+) -> AnalysisResult:
+    """Run the reproducible baseline -> peak -> nuclide matching pipeline."""
+
+    record = _validated_record(record)
+    settings = (config or AnalysisConfig()).validated()
+    reference_library = validate_nuclide_library(library or NNDC_LIBRARY)
+    baseline = snip_baseline(record.counts, iterations=settings.snip_iterations)
+    net_counts = np.clip(record.counts - baseline, 0, None)
+    candidates = detect_peaks_from_cwt(
+        net_counts,
+        widths=settings.wavelet_widths,
+        min_distance=settings.min_peak_distance,
+        threshold_sigma=settings.detection_threshold_sigma,
+    )
+    peaks = refine_peaks(
+        record.channels,
+        net_counts,
+        record.counts,
+        candidates,
+        min_snr=settings.min_snr,
+    )
+    model = calibration or CalibrationModel()
+    match_nuclides(
+        peaks,
+        model,
+        flatten_library(reference_library),
+        absolute_tolerance_kev=settings.absolute_tolerance_kev,
+        relative_tolerance=settings.relative_tolerance,
+        max_candidates=settings.max_candidates,
+    )
+    summary = summarize_nuclide_matches(
+        peaks,
+        reference_library,
+        absolute_tolerance_kev=settings.absolute_tolerance_kev,
+        relative_tolerance=settings.relative_tolerance,
+    )
+    return AnalysisResult(baseline=baseline, net_counts=net_counts, peaks=peaks, nuclide_summary=summary)
+
+
+def ensure_directory(path: str) -> None:
+    if not os.path.isdir(path):
+        os.makedirs(path, exist_ok=True)

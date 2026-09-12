@@ -1,0 +1,64 @@
+{
+  "source": "synthetic_co60.spe",
+  "channels": 4096,
+  "real_time_s": 300.0,
+  "live_time_s": 295.0,
+  "calibration": {
+    "slope_kev_per_channel": 0.4,
+    "offset_kev": 0.0
+  },
+  "reference_library": "custom_library.csv",
+  "analysis_config": {
+    "snip_iterations": null,
+    "wavelet_widths": [
+      2,
+      4,
+      6,
+      8,
+      10,
+      12
+    ],
+    "detection_threshold_sigma": 1.0,
+    "min_peak_distance": 6,
+    "min_snr": 1.25,
+    "absolute_tolerance_kev": 0.5,
+    "relative_tolerance": 0.002,
+    "max_candidates": 3
+  },
+  "nuclide_summary": [
+    {
+      "nuclide": "co-60",
+      "matched_lines": 2,
+      "total_reference_lines": 2,
+      "intensity_coverage": 1.0,
+      "match_score": 0.997
+    }
+  ],
+  "peaks": [
+    {
+      "channel": 2933.1191,
+      "energy_kev": 1173.2477,
+      "area": 12323.0,
+      "fwhm_channel": 12.8837,
+      "snr": 41.8776,
+      "primary_isotope": "co-60",
+      "candidates": [
+        "co-60 (1173.2 keV)"
+      ],
+      "match_score": 0.9951
+    },
+    {
+      "channel": 3331.1516,
+      "energy_kev": 1332.4606,
+      "area": 11819.0,
+      "fwhm_channel": 13.6788,
+      "snr": 38.1441,
+      "primary_isotope": "co-60",
+      "candidates": [
+        "co-60 (1332.5 keV)"
+      ],
+      "match_score": 0.9845
+    }
+  ],
+  "warning": "Teaching/research prototype; results are not certified measurements."
+}

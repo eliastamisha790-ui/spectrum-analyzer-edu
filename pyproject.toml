@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spectrum-analyzer-edu"
+version = "0.3.0"
+description = "Educational desktop toolkit for gamma-spectrum visualization, peak detection, calibration, and nuclide matching"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "罗俊仁" }]
+license = { file = "LICENSE" }
+dependencies = [
+  "numpy>=1.24,<3",
+]
+
+[project.optional-dependencies]
+gui = [
+  "PyQt5>=5.15.9,<6",
+  "pyqtgraph>=0.13.3,<1",
+]
+dev = [
+  "pytest>=8,<9",
+]
+
+[project.scripts]
+spectrum-analyzer = "spectrum_analyzer.app:main"
+spectrum-analyzer-cli = "spectrum_analyzer.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
