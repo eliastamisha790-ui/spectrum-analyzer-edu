@@ -313,6 +313,24 @@ class InterferenceLine:
 
 
 @dataclass
+class PeakComponent:
+    """One component of a multi-line fit inside a single observed peak."""
+
+    isotope: str
+    energy: float
+    area: float
+    area_uncertainty: float
+    share: float
+    share_uncertainty: float
+
+    def as_text(self) -> str:
+        return (
+            f"{self.isotope} {self.energy:.3f} keV: {self.area:.1f}±{self.area_uncertainty:.1f} "
+            f"({self.share * 100:.0f}%±{self.share_uncertainty * 100:.0f}%)"
+        )
+
+
+@dataclass
 class PeakResult:
     channel: float
     fwhm: float
@@ -326,6 +344,10 @@ class PeakResult:
     activity_bq: Optional[float] = None
     interference: List[InterferenceLine] = field(default_factory=list)
     fwhm_kev: float = 0.0
+    area_uncertainty: float = 0.0
+    components: List[PeakComponent] = field(default_factory=list)
+    decomposition_resolved: bool = False
+    decomposition_note: str = ""
 
     @property
     def is_ambiguous(self) -> bool:
@@ -1255,8 +1277,348 @@ def refine_peaks(
         if snr < min_snr:
             continue
         area = float(_trapz(y, x))
-        peaks.append(PeakResult(channel=mu, fwhm=fwhm, area=area, snr=snr))
+        area_uncertainty = 0.0
+        fitted = fit_peak_shape(x, segment, mu, sigma, amplitude)
+        if fitted is not None:
+            fit_area = fitted["area"]
+            plausible = (
+                0.2 * area <= fit_area <= 5.0 * area
+                and 0.5 * sigma <= fitted["sigma"] <= 2.0 * sigma
+                and abs(fitted["center"] - mu) <= 1.5 * sigma
+            )
+            if plausible:
+                mu = fitted["center"]
+                sigma = fitted["sigma"]
+                fwhm = fitted["fwhm"]
+                area = fit_area
+                area_uncertainty = fitted["area_uncertainty"]
+        peaks.append(
+            PeakResult(
+                channel=mu,
+                fwhm=fwhm,
+                area=area,
+                snr=snr,
+                area_uncertainty=area_uncertainty,
+            )
+        )
     return peaks
+
+
+def merge_close_peaks(peaks: List[PeakResult], factor: float = 0.5) -> List[PeakResult]:
+    """Merge peaks that landed closer than half a line width of each other.
+
+    A broad low-energy line often produces two wavelet maxima a few channels
+    apart; after individual fits they can collapse onto the same centroid and
+    would otherwise be reported twice. Merged peaks keep the area-weighted centre
+    and the summed area, with uncertainties added in quadrature.
+    """
+
+    if not peaks:
+        return peaks
+    ordered = sorted(peaks, key=lambda item: item.channel)
+    merged: List[PeakResult] = []
+    for peak in ordered:
+        if not merged:
+            merged.append(peak)
+            continue
+        previous = merged[-1]
+        separation = peak.channel - previous.channel
+        threshold = factor * max(peak.fwhm, previous.fwhm)
+        if separation <= threshold:
+            total_area = previous.area + peak.area
+            if total_area > 0:
+                previous.channel = (previous.channel * previous.area + peak.channel * peak.area) / total_area
+            else:
+                previous.channel = 0.5 * (previous.channel + peak.channel)
+            previous.fwhm = max(previous.fwhm, peak.fwhm)
+            previous.area = total_area
+            previous.area_uncertainty = math.hypot(previous.area_uncertainty, peak.area_uncertainty)
+            previous.snr = max(previous.snr, peak.snr)
+        else:
+            merged.append(peak)
+    return merged
+
+
+def _gauss_shape(x: np.ndarray, mu: float, sigma: float) -> np.ndarray:
+    sigma = max(float(sigma), 1e-6)
+    return np.exp(-0.5 * ((x - float(mu)) / sigma) ** 2)
+
+
+def fit_peak_shape(
+    x: np.ndarray,
+    y: np.ndarray,
+    mu0: float,
+    sigma0: float,
+    amplitude0: float,
+    max_iter: int = 60,
+) -> Optional[Dict[str, float]]:
+    """Fit a Gaussian plus a linear baseline to one peak window.
+
+    Returns the centre, width, area, area uncertainty and reduced chi-square, or
+    ``None`` when the fit does not converge to a plausible shape. Uncertainties
+    come from the linearised covariance matrix and therefore describe counting
+    scatter of this model only, not systematic effects such as summing,
+    attenuation or an incorrect efficiency curve.
+    """
+
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    if len(x) < 8 or len(x) != len(y) or not np.all(np.isfinite(y)):
+        return None
+    x0 = float(np.mean(x))
+    p = np.array(
+        [max(float(amplitude0), 1.0), float(mu0), max(float(sigma0), 0.5), float(np.min(y)), 0.0],
+        dtype=float,
+    )
+
+    def model(params: np.ndarray) -> np.ndarray:
+        amplitude, mu, sigma, b0, b1 = params
+        return amplitude * _gauss_shape(x, mu, sigma) + b0 + b1 * (x - x0)
+
+    def jacobian(params: np.ndarray) -> np.ndarray:
+        amplitude, mu, sigma, b0, b1 = params
+        shape = _gauss_shape(x, mu, sigma)
+        delta = x - mu
+        return np.column_stack(
+            [
+                shape,
+                amplitude * shape * delta / sigma ** 2,
+                amplitude * shape * delta ** 2 / sigma ** 3,
+                np.ones_like(x),
+                x - x0,
+            ]
+        )
+
+    residual = y - model(p)
+    rss = float(residual @ residual)
+    best_p, best_rss = p.copy(), rss
+    lam = 1e-2
+    step = np.zeros_like(p)
+    for _ in range(max_iter):
+        try:
+            jac = jacobian(p)
+        except (OverflowError, ZeroDivisionError):
+            break
+        normal = jac.T @ jac
+        gradient = jac.T @ residual
+        accepted = False
+        for _ in range(10):
+            try:
+                step = np.linalg.solve(normal + lam * np.diag(np.diag(normal) + 1e-12), gradient)
+            except np.linalg.LinAlgError:
+                lam *= 10.0
+                continue
+            trial = p + step
+            if trial[2] <= 0.25 or trial[0] <= 0:
+                lam *= 10.0
+                continue
+            trial_residual = y - model(trial)
+            trial_rss = float(trial_residual @ trial_residual)
+            if np.isfinite(trial_rss) and trial_rss < rss:
+                p, residual, rss = trial, trial_residual, trial_rss
+                lam = max(lam / 3.0, 1e-9)
+                accepted = True
+                break
+            lam *= 10.0
+        if not accepted:
+            break
+        if rss < best_rss:
+            best_p, best_rss = p.copy(), rss
+        if abs(step[1]) < 1e-4 and abs(step[2]) < 1e-4 and abs(step[0]) < 1e-3 * max(best_p[0], 1.0):
+            break
+
+    amplitude, mu, sigma, _, _ = best_p
+    if not np.isfinite(best_rss) or amplitude <= 0 or sigma <= 0:
+        return None
+    try:
+        jac = jacobian(best_p)
+        dof = max(len(x) - 5, 1)
+        cov = (best_rss / dof) * np.linalg.pinv(jac.T @ jac)
+    except (np.linalg.LinAlgError, OverflowError, ZeroDivisionError):
+        return None
+    root_two_pi = math.sqrt(2.0 * math.pi)
+    area = amplitude * sigma * root_two_pi
+    gradient_area = np.array([sigma * root_two_pi, 0.0, amplitude * root_two_pi, 0.0, 0.0])
+    area_variance = float(gradient_area @ cov @ gradient_area)
+    return {
+        "center": float(mu),
+        "sigma": float(sigma),
+        "fwhm": 2.35482 * float(sigma),
+        "amplitude": float(amplitude),
+        "area": float(area),
+        "area_uncertainty": math.sqrt(max(area_variance, 0.0)),
+        "reduced_chi2": float(best_rss / dof),
+    }
+
+
+def energy_to_channel(
+    calibration: CalibrationModel,
+    energy: float,
+    channel_min: float,
+    channel_max: float,
+) -> float:
+    """Invert a linear or quadratic calibration by bisection inside a bracket."""
+
+    low, high = float(channel_min), float(channel_max)
+    f_low = calibration.energy(low) - float(energy)
+    f_high = calibration.energy(high) - float(energy)
+    if abs(f_low) < 1e-9:
+        return low
+    if abs(f_high) < 1e-9:
+        return high
+    if f_low * f_high > 0:
+        slope = calibration.slope(0.5 * (low + high))
+        if abs(slope) < 1e-12:
+            return 0.5 * (low + high)
+        return low + (float(energy) - calibration.energy(low)) / slope
+    for _ in range(80):
+        middle = 0.5 * (low + high)
+        f_middle = calibration.energy(middle) - float(energy)
+        if f_low * f_middle <= 0:
+            high = middle
+        else:
+            low, f_low = middle, f_middle
+    return 0.5 * (low + high)
+
+
+def _fit_component_amplitudes(
+    x: np.ndarray,
+    y: np.ndarray,
+    centers: List[float],
+    sigma: float,
+) -> Tuple[np.ndarray, np.ndarray, float]:
+    """Linear least squares for fixed centroids and a shared width."""
+
+    x0 = float(np.mean(x))
+    columns = [_gauss_shape(x, center, sigma) for center in centers]
+    columns.append(np.ones_like(x))
+    columns.append(x - x0)
+    design = np.column_stack(columns)
+    try:
+        coefficients, *_ = np.linalg.lstsq(design, y, rcond=None)
+    except np.linalg.LinAlgError:
+        return np.zeros(design.shape[1]), np.zeros((design.shape[1], design.shape[1])), float("inf")
+    residual = y - design @ coefficients
+    rss = float(residual @ residual)
+    dof = max(len(x) - design.shape[1], 1)
+    try:
+        cov = (rss / dof) * np.linalg.pinv(design.T @ design)
+    except np.linalg.LinAlgError:
+        cov = np.zeros((design.shape[1], design.shape[1]))
+    return coefficients, cov, rss
+
+
+def decompose_interference(
+    peaks: List[PeakResult],
+    channels: np.ndarray,
+    net_counts: np.ndarray,
+    calibration: CalibrationModel,
+    window_sigmas: float = 4.0,
+    min_points: int = 10,
+    min_separation_fwhm: float = 1.0,
+) -> None:
+    """Split an unresolved multiplet into library-constrained components.
+
+    Component energies are taken from the reference library, so only the
+    amplitudes and one shared width are fitted; with fixed centroids the problem
+    is linear in the amplitudes and stays stable. Two gates decide whether the
+    result may be trusted:
+
+    * the components must be separated by at least ``min_separation_fwhm`` line
+      widths — below that the fit is numerically possible but depends on the peak
+      shape, calibration and counting statistics more than the data can support;
+    * every component needs a positive area, a relative uncertainty below 50%
+      and fitted amplitudes that are not almost perfectly correlated.
+
+    Statistical uncertainty alone is never enough here: with good statistics the
+    covariance matrix will happily return a tight 50/50 split of one blended peak.
+    """
+
+    channels = np.asarray(channels, dtype=float)
+    net_counts = np.asarray(net_counts, dtype=float)
+    if len(channels) != len(net_counts):
+        return
+    for peak in peaks:
+        peak.components = []
+        peak.decomposition_resolved = False
+        peak.decomposition_note = ""
+        if not peak.interference:
+            continue
+        energies = sorted(line.energy for line in peak.interference)
+        separations = [
+            energies[index + 1] - energies[index] for index in range(len(energies) - 1)
+        ]
+        closest = min(separations) if separations else float("inf")
+        fwhm_kev = peak.fwhm_kev if peak.fwhm_kev > 0 else float(peak.fwhm) * abs(calibration.slope(peak.channel))
+        separation_ratio = closest / fwhm_kev if fwhm_kev > 0 else float("inf")
+        sigma0 = max(float(peak.fwhm) / 2.35482, 0.5)
+        half_window = max(window_sigmas * sigma0, 8.0)
+        left = int(np.searchsorted(channels, peak.channel - half_window))
+        right = int(np.searchsorted(channels, peak.channel + half_window))
+        left = max(left, 0)
+        right = min(max(right, left + min_points), len(channels))
+        if right - left < min_points:
+            continue
+        x = channels[left:right]
+        y = net_counts[left:right]
+        if not np.all(np.isfinite(y)) or float(np.max(y)) <= 0:
+            continue
+        centers = [
+            energy_to_channel(calibration, line.energy, float(x[0]), float(x[-1]))
+            for line in peak.interference
+        ]
+        best: Optional[Tuple[float, float, np.ndarray, np.ndarray]] = None
+        for factor in np.linspace(0.45, 1.75, 27):
+            sigma = sigma0 * float(factor)
+            coefficients, cov, rss = _fit_component_amplitudes(x, y, centers, sigma)
+            if best is None or rss < best[0]:
+                best = (rss, sigma, coefficients, cov)
+        if best is None:
+            continue
+        _, sigma, coefficients, cov = best
+        root_two_pi = math.sqrt(2.0 * math.pi)
+        areas = [max(float(coefficients[index]), 0.0) * sigma * root_two_pi for index in range(len(centers))]
+        total_area = sum(areas)
+        if total_area <= 0:
+            peak.decomposition_note = "多峰拟合没有给出正面积，无法分解。"
+            continue
+        components: List[PeakComponent] = []
+        resolved = True
+        for index, line in enumerate(peak.interference):
+            area = areas[index]
+            area_sigma = math.sqrt(max(float(cov[index, index]), 0.0)) * sigma * root_two_pi
+            components.append(
+                PeakComponent(
+                    isotope=line.isotope,
+                    energy=line.energy,
+                    area=area,
+                    area_uncertainty=area_sigma,
+                    share=area / total_area,
+                    share_uncertainty=area_sigma / total_area,
+                )
+            )
+            if area <= 0 or area_sigma / area >= 0.5:
+                resolved = False
+        for i in range(len(centers)):
+            for j in range(i + 1, len(centers)):
+                denominator = math.sqrt(max(float(cov[i, i]), 0.0) * max(float(cov[j, j]), 0.0))
+                if denominator > 0 and abs(float(cov[i, j]) / denominator) >= 0.95:
+                    resolved = False
+        if separation_ratio < float(min_separation_fwhm):
+            resolved = False
+        peak.components = components
+        peak.decomposition_resolved = resolved
+        if resolved:
+            peak.decomposition_note = "多峰拟合可分解。"
+        elif separation_ratio < float(min_separation_fwhm):
+            peak.decomposition_note = (
+                f"成分间距仅 {separation_ratio:.2f} FWHM（阈值 {min_separation_fwhm:.2f}），"
+                "低于可分解门限；拟合值仅供参考，不作为定量依据。"
+            )
+        else:
+            peak.decomposition_note = (
+                "多峰拟合不唯一（成分强相关或相对不确定度 ≥50%），不采信分解值。"
+            )
 
 
 def flatten_library(library: Dict[str, List[Dict[str, float]]]) -> List[Dict[str, float]]:
@@ -1458,12 +1820,14 @@ def analyze_spectrum(
         min_distance=settings.min_peak_distance,
         threshold_sigma=settings.detection_threshold_sigma,
     )
-    peaks = refine_peaks(
-        record.channels,
-        net_counts,
-        analysis_counts,
-        candidates,
-        min_snr=settings.min_snr,
+    peaks = merge_close_peaks(
+        refine_peaks(
+            record.channels,
+            net_counts,
+            analysis_counts,
+            candidates,
+            min_snr=settings.min_snr,
+        )
     )
     model = calibration or CalibrationModel()
     match_nuclides(
@@ -1483,6 +1847,7 @@ def analyze_spectrum(
         relative_tolerance=settings.relative_tolerance,
         width_tolerance_factor=settings.width_tolerance_factor,
     )
+    decompose_interference(peaks, record.channels, net_counts, model)
     return AnalysisResult(
         baseline=baseline,
         net_counts=net_counts,

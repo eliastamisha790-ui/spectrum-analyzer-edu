@@ -36,37 +36,41 @@
       "ambiguous_lines": 0,
       "total_reference_lines": 2,
       "intensity_coverage": 1.0,
-      "match_score": 0.9972
+      "match_score": 0.9983
     }
   ],
   "peaks": [
     {
-      "channel": 2933.1191,
-      "energy_kev": 1173.2477,
-      "area": 12323.0,
-      "fwhm_channel": 12.8837,
-      "fwhm_kev": 5.1535,
+      "channel": 2933.131,
+      "energy_kev": 1173.2524,
+      "area": 12460.4,
+      "area_uncertainty": 166.6049,
+      "fwhm_channel": 13.1073,
+      "fwhm_kev": 5.2429,
       "snr": 41.8776,
       "primary_isotope": "co-60",
       "candidates": [
         "co-60 (1173.2 keV)"
       ],
-      "match_score": 0.9955,
-      "unresolved_doublet": []
+      "match_score": 0.9937,
+      "unresolved_doublet": [],
+      "decomposition": null
     },
     {
-      "channel": 3331.1516,
-      "energy_kev": 1332.4606,
-      "area": 11819.0,
-      "fwhm_channel": 13.6788,
-      "fwhm_kev": 5.4715,
+      "channel": 3331.2136,
+      "energy_kev": 1332.4854,
+      "area": 11901.4605,
+      "area_uncertainty": 232.6768,
+      "fwhm_channel": 13.8501,
+      "fwhm_kev": 5.5401,
       "snr": 38.1441,
       "primary_isotope": "co-60",
       "candidates": [
         "co-60 (1332.5 keV)"
       ],
-      "match_score": 0.9849,
-      "unresolved_doublet": []
+      "match_score": 0.994,
+      "unresolved_doublet": [],
+      "decomposition": null
     }
   ],
   "warning": "Teaching/research prototype; results are not certified measurements."

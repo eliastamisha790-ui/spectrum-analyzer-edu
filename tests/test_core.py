@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,15 +10,19 @@ import numpy as np
 from spectrum_analyzer.core import (
     AnalysisConfig,
     CalibrationModel,
+    InterferenceLine,
     NNDC_LIBRARY,
     PeakResult,
     SpectrumRecord,
     analyze_spectrum,
+    decompose_interference,
     fit_energy_calibration,
+    fit_peak_shape,
     flatten_library,
     load_nuclide_library,
     load_spectrum_file,
     match_nuclides,
+    merge_close_peaks,
     subtract_background,
     summarize_nuclide_matches,
 )
@@ -323,6 +328,69 @@ class BackgroundTests(unittest.TestCase):
         flat_result = analyze_spectrum(record, calibration, config=config, background=background)
         self.assertEqual(flat_result.background.continuum, "none")
         np.testing.assert_allclose(flat_result.baseline, np.zeros_like(record.counts))
+
+
+class PeakFitTests(unittest.TestCase):
+    def _gaussian_spectrum(self, lines, sigma, baseline=10.0, seed=3, length=220):
+        rng = np.random.default_rng(seed)
+        x = np.arange(length, dtype=float)
+        expected = np.full(length, baseline, dtype=float)
+        for centre, amplitude in lines:
+            expected += amplitude * np.exp(-0.5 * ((x - centre) / sigma) ** 2)
+        return x, rng.poisson(expected).astype(float)
+
+    def test_gaussian_fit_recovers_area_with_uncertainty(self) -> None:
+        x, counts = self._gaussian_spectrum([(110.0, 400.0)], sigma=5.0)
+        window = slice(80, 140)
+        fit = fit_peak_shape(x[window], counts[window], 110.0, 5.0, 400.0)
+        self.assertIsNotNone(fit)
+        expected_area = 400.0 * 5.0 * np.sqrt(2.0 * np.pi)
+        self.assertAlmostEqual(fit["area"], expected_area, delta=expected_area * 0.05)
+        self.assertAlmostEqual(fit["center"], 110.0, delta=0.2)
+        self.assertGreater(fit["area_uncertainty"], 0.0)
+        self.assertLess(fit["area_uncertainty"], expected_area * 0.05)
+
+    def test_close_peaks_are_merged(self) -> None:
+        peaks = [
+            PeakResult(channel=100.0, fwhm=10.0, area=300.0, snr=20.0, area_uncertainty=30.0),
+            PeakResult(channel=102.0, fwhm=10.0, area=100.0, snr=15.0, area_uncertainty=20.0),
+            PeakResult(channel=200.0, fwhm=10.0, area=50.0, snr=8.0),
+        ]
+        merged = merge_close_peaks(peaks)
+        self.assertEqual(len(merged), 2)
+        self.assertAlmostEqual(merged[0].area, 400.0)
+        self.assertAlmostEqual(merged[0].channel, 100.5)
+        self.assertAlmostEqual(merged[0].area_uncertainty, math.hypot(30.0, 20.0))
+
+    def test_doublet_decomposition_recovers_separated_components(self) -> None:
+        x, counts = self._gaussian_spectrum([(90.0, 300.0), (99.0, 200.0)], sigma=3.0)
+        peak = PeakResult(channel=94.5, fwhm=3.0 * 2.35482, area=1000.0, snr=30.0)
+        peak.fwhm_kev = peak.fwhm
+        peak.interference = [
+            InterferenceLine(isotope="alpha", energy=90.0, intensity=0.5, delta_kev=-4.5, weight=0.5),
+            InterferenceLine(isotope="beta", energy=99.0, intensity=0.5, delta_kev=4.5, weight=0.5),
+        ]
+        decompose_interference([peak], x, counts, CalibrationModel([1.0, 0.0]))
+        self.assertTrue(peak.decomposition_resolved)
+        self.assertEqual([component.isotope for component in peak.components], ["alpha", "beta"])
+        areas = {component.isotope: component.area for component in peak.components}
+        expected = {isotope: amplitude * 3.0 * np.sqrt(2.0 * np.pi) for isotope, amplitude in (("alpha", 300.0), ("beta", 200.0))}
+        for isotope, value in expected.items():
+            self.assertAlmostEqual(areas[isotope], value, delta=value * 0.25)
+        self.assertAlmostEqual(sum(component.share for component in peak.components), 1.0, places=6)
+
+    def test_doublet_decomposition_is_rejected_when_blended(self) -> None:
+        x, counts = self._gaussian_spectrum([(95.0, 400.0), (96.0, 380.0)], sigma=4.0)
+        peak = PeakResult(channel=95.5, fwhm=4.0 * 2.35482, area=4000.0, snr=40.0)
+        peak.fwhm_kev = peak.fwhm
+        peak.interference = [
+            InterferenceLine(isotope="alpha", energy=95.0, intensity=0.5, delta_kev=-0.5, weight=0.5),
+            InterferenceLine(isotope="beta", energy=96.0, intensity=0.5, delta_kev=0.5, weight=0.5),
+        ]
+        decompose_interference([peak], x, counts, CalibrationModel([1.0, 0.0]))
+        self.assertFalse(peak.decomposition_resolved)
+        self.assertIn("FWHM", peak.decomposition_note)
+        self.assertEqual(len(peak.components), 2)
 
 
 if __name__ == "__main__":

@@ -97,6 +97,7 @@ def analyze_file(
                 "channel": round(peak.channel, 4),
                 "energy_kev": round(peak.energy, 4),
                 "area": round(peak.area, 4),
+                "area_uncertainty": round(peak.area_uncertainty, 4),
                 "fwhm_channel": round(peak.fwhm, 4),
                 "fwhm_kev": round(peak.fwhm_kev, 4),
                 "snr": round(peak.snr, 4),
@@ -115,6 +116,23 @@ def analyze_file(
                 ]
                 if peak.is_ambiguous
                 else [],
+                "decomposition": {
+                    "resolved": peak.decomposition_resolved,
+                    "note": peak.decomposition_note,
+                    "components": [
+                        {
+                            "nuclide": component.isotope,
+                            "energy_kev": component.energy,
+                            "area": round(component.area, 4),
+                            "area_uncertainty": round(component.area_uncertainty, 4),
+                            "share": round(component.share, 4),
+                            "share_uncertainty": round(component.share_uncertainty, 4),
+                        }
+                        for component in peak.components
+                    ],
+                }
+                if peak.is_ambiguous
+                else None,
             }
             for peak in result.peaks
         ],

@@ -27,4 +27,4 @@ __all__ = [
     "load_spectrum_file",
     "subtract_background",
 ]
-__version__ = "0.4.0"
+__version__ = "0.5.0"

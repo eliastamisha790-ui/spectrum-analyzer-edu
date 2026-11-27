@@ -27,6 +27,7 @@ from .core import (
     SpectrumRecord,
     SPECTRUM_FILE_FILTER,
     detect_peaks_from_cwt,
+    decompose_interference,
     ensure_directory,
     fit_energy_calibration,
     flatten_library,
@@ -34,6 +35,7 @@ from .core import (
     load_nuclide_library,
     load_spectrum_file,
     match_nuclides,
+    merge_close_peaks,
     refine_peaks,
     smooth_spectrum,
     snip_baseline,
@@ -471,7 +473,7 @@ class AxisLockedViewBox(pg.ViewBox):
 class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("能谱分析工作台 v0.4")
+        self.setWindowTitle("能谱分析工作台 v0.5")
         self.resize(1280, 760)
         self.current_spectrum: Optional[SpectrumRecord] = None
         self.background_spectrum: Optional[SpectrumRecord] = None
@@ -1145,12 +1147,14 @@ class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
             min_distance=self.analysis_config.min_peak_distance,
             threshold_sigma=self.analysis_config.detection_threshold_sigma,
         )
-        peaks = refine_peaks(
-            self.current_spectrum.channels,
-            net_counts,
-            self.current_spectrum.counts,
-            candidates,
-            min_snr=self.analysis_config.min_snr,
+        peaks = merge_close_peaks(
+            refine_peaks(
+                self.current_spectrum.channels,
+                net_counts,
+                self.current_spectrum.counts,
+                candidates,
+                min_snr=self.analysis_config.min_snr,
+            )
         )
         return peaks
 
@@ -1172,6 +1176,13 @@ class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
             relative_tolerance=self.analysis_config.relative_tolerance,
             width_tolerance_factor=self.analysis_config.width_tolerance_factor,
         )
+        if self.net_counts is not None and self.current_spectrum is not None:
+            decompose_interference(
+                peaks,
+                self.current_spectrum.channels,
+                self.net_counts,
+                self.calibration,
+            )
 
     def _close_peak_dialog(self) -> None:
         if self._peak_dialog:
@@ -1731,12 +1742,21 @@ class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
             confidence_text = f"匹配分数 {peak.confidence * 100:.1f}%"
             if peak.is_ambiguous:
                 confidence_text = "匹配分数 —（双线不可分辨）"
+            area_text = f"{peak.area:.1f}"
+            if peak.area_uncertainty > 0:
+                area_text += f" ± {peak.area_uncertainty:.1f}"
             lines.append(
-                f"[{idx}] 通道 {peak.channel:.1f}	能量 {peak.energy:.2f} keV	面积 {peak.area:.1f}	"
+                f"[{idx}] 通道 {peak.channel:.1f}	能量 {peak.energy:.2f} keV	面积 {area_text}	"
                 f"FWHM {peak.fwhm:.2f} ch / {peak.fwhm_kev:.2f} keV	候选 {candidate_text}	"
                 f"{confidence_text}	活度 {format_activity(peak.activity_bq)}"
             )
         ambiguous_peaks = [peak for peak in self.peaks if peak.is_ambiguous]
+        unfitted = [peak for peak in self.peaks if peak.area_uncertainty <= 0]
+        if unfitted:
+            lines.append("")
+            lines.append(
+                f"  注：{len(unfitted)} 个峰未通过高斯拟合一致性检查，面积按窗口求和给出、未估计不确定度。"
+            )
         if ambiguous_peaks:
             lines.append("")
             lines.append("双线 / 干扰说明（标准为“库内两条参考线间距小于本峰 FWHM，本次未指定主核素”）:")
@@ -1748,6 +1768,13 @@ class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
                 lines.append(
                     f"  {peak.energy:.2f} keV（FWHM {peak.fwhm_kev:.2f} keV）：{detail}"
                 )
+                if peak.components:
+                    verdict = "可采信" if peak.decomposition_resolved else "不采信"
+                    lines.append(f"    → 固定能量多峰拟合（{verdict}）：")
+                    for component in peak.components:
+                        lines.append(f"      {component.as_text()}")
+                    if peak.decomposition_note:
+                        lines.append(f"      说明：{peak.decomposition_note}")
             lines.append("  → 该峰的活度与核素归属需用其他谱线或更高分辨率复测来确认，软件不做强行指派。")
         if self.nuclide_summary:
             lines.append("")
@@ -1853,6 +1880,15 @@ class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
             for col, value in enumerate(peak.as_row()):
                 item = QtWidgets.QTableWidgetItem(value)
                 item.setToolTip(value)
+                if col == 2 and peak.area_uncertainty > 0 and peak.area > 0:
+                    item.setToolTip(
+                        f"{peak.area:.1f} ± {peak.area_uncertainty:.1f} "
+                        f"（{peak.area_uncertainty / peak.area * 100:.1f}%，高斯拟合统计不确定度）"
+                    )
+                if col == 4 and peak.components:
+                    detail = "；".join(component.as_text() for component in peak.components)
+                    verdict = "可采信" if peak.decomposition_resolved else "不采信"
+                    item.setToolTip(f"{value}\n固定能量多峰拟合（{verdict}）：{detail}\n{peak.decomposition_note}")
                 self.peaks_table.setItem(row, col, item)
         self._update_peak_annotations()
         self._update_identification_summary_table()
