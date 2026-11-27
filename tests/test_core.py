@@ -29,7 +29,10 @@ from spectrum_analyzer.core import (
 from spectrum_analyzer.demo import (
     DEMO_OFFSET_KEV,
     DEMO_SLOPE_KEV_PER_CHANNEL,
+    DOUBLET_OFFSET_KEV,
+    DOUBLET_SLOPE_KEV_PER_CHANNEL,
     synthetic_co60_record,
+    synthetic_doublet_record,
     write_spe,
 )
 
@@ -194,6 +197,22 @@ class InterferenceTests(unittest.TestCase):
         self.assertIn("ra-226", by_isotope)
         self.assertEqual(by_isotope["ra-226"].ambiguous_lines, 1)
         self.assertLess(by_isotope["ra-226"].intensity_coverage, 0.6)
+
+    def test_synthetic_doublet_example_is_flagged_end_to_end(self) -> None:
+        record = synthetic_doublet_record()
+        result = analyze_spectrum(
+            record,
+            CalibrationModel([DOUBLET_SLOPE_KEV_PER_CHANNEL, DOUBLET_OFFSET_KEV]),
+        )
+        doublets = [peak for peak in result.peaks if peak.is_ambiguous]
+        self.assertEqual(len(doublets), 1)
+        self.assertAlmostEqual(doublets[0].energy, 186.0, delta=0.6)
+        self.assertEqual(
+            {line.isotope for line in doublets[0].interference},
+            {"u-235", "ra-226"},
+        )
+        self.assertEqual(doublets[0].primary_isotope, "")
+        self.assertGreater(doublets[0].area_uncertainty, 0.0)
 
 
 class BackgroundTests(unittest.TestCase):

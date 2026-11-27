@@ -365,9 +365,7 @@ class PeakResult:
     def as_row(self) -> List[str]:
         activity = format_activity(self.activity_bq)
         if self.is_ambiguous:
-            candidate_text = "† " + " + ".join(
-                f"{line.isotope}({line.energy:.1f})" for line in self.interference[:3]
-            )
+            candidate_text = "† " + "/".join(line.isotope for line in self.interference[:3])
         else:
             candidate_text = ", ".join(self.nuclide_candidates) if self.nuclide_candidates else "—"
         confidence_text = f"{self.confidence * 100:.1f}%" + ("†" if self.is_ambiguous else "")

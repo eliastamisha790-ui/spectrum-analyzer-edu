@@ -1,5 +1,9 @@
 # 能谱分析工作台
 
+[![tests](https://github.com/eliastamisha790-ui/spectrum-analyzer-edu/actions/workflows/tests.yml/badge.svg)](https://github.com/eliastamisha790-ui/spectrum-analyzer-edu/actions/workflows/tests.yml)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](pyproject.toml)
+
 一个面向核工程教学与课程项目展示的伽马能谱分析桌面原型。项目可读取常见谱文件，完成能谱可视化、本底扣除、峰识别、能量刻度、核素候选匹配和基于效率曲线的活度估算。
 
 > 本项目是教学/科研原型，不是经计量检定或安全认证的软件。输出必须由具备相关知识的人员复核，不得直接用于安全、医疗、监管或环境合规决策。
@@ -24,6 +28,12 @@
 - 核心算法与桌面界面分离；命令行和自动化测试不依赖图形环境。
 - 仓库只使用可公开的合成示例谱，不包含第三方实测数据或打包运行库。
 
+### 双线（不可分辨）处理示例
+
+合成示例 `examples\synthetic_doublet.spe` 中，U-235 的 185.7 keV 与 Ra-226 的 186.2 keV 只相差 0.5 keV，而探测器 FWHM 为 1.4 keV。这种间距下把峰判给任何一个核素都是伪确定性：软件会标 `†`、列出两个成分，并在整谱汇总里注明“含 1 条双线”。
+
+![186 keV 双线标注](docs/screenshot-doublet.png)
+
 ## 快速体验
 
 需要 Python 3.10 或更高版本。
@@ -40,6 +50,8 @@ spectrum-analyzer
 打开程序后点击“加载合成示例”，即可看到两个模拟的 Co-60 光电峰。该示例由固定随机种子生成，并明确标记为合成数据。
 
 想看实测本底扣除的效果：先导入 `examples\synthetic_sample_with_k40.spe`（Co-60 加一条模拟环境 K-40 线），再点“导入本底谱”选择 `examples\synthetic_lab_background.spe`。扣除后 1460.8 keV 的 K-40 峰消失，只剩 Co-60 两条线；灰色虚线是本底谱，橙色虚线是净谱。
+
+想看双线标注：导入 `examples\synthetic_doublet.spe`，再把能量刻度设为 `斜率 0.137145、截距 0.0133`（或直接命令行加 `--slope 0.137145 --offset 0.0133`）。
 
 只运行核心分析时，不需要安装 PyQt5：
 
@@ -90,10 +102,11 @@ python -m unittest discover -s tests -v
 ## 数据与目录
 
 ```text
-examples/                    合成示例谱与可复现输出
+examples/                    合成示例谱与可复现输出（Co-60、K-40+本底、186 keV 双线）
 src/spectrum_analyzer/       核心算法、桌面界面和命令行入口
 tests/                       不依赖 GUI 的单元测试
-docs/                        算法、限制和数据政策
+tools/                       截图生成脚本（capture_demo / capture_doublet）
+docs/                        算法、限制、数据政策和界面截图
 ```
 
 用户生成的效率模型和报告默认写入 `%USERPROFILE%\.spectrum-analyzer`，不会写回仓库。数据收录原则见 [数据政策](docs/DATA_POLICY.md)。

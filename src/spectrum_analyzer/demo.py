@@ -12,6 +12,47 @@ from .core import SpectrumRecord
 DEMO_SLOPE_KEV_PER_CHANNEL = 0.4
 DEMO_OFFSET_KEV = 0.0
 
+# 16384 道、约 2245 keV 量程，峰宽 1.4 keV，与常见教学 HPGe 谱接近
+DOUBLET_SLOPE_KEV_PER_CHANNEL = 0.137145
+DOUBLET_OFFSET_KEV = 0.0133
+DOUBLET_FWHM_KEV = 1.4
+
+
+def synthetic_doublet_record(seed: int = 2028) -> SpectrumRecord:
+    """Synthetic U-238-series spectrum whose 186 keV peak is an unresolved doublet.
+
+    U-235 (185.715 keV, 57.2% per decay) and Ra-226 (186.211 keV, 3.64%) are only
+    0.5 keV apart, while the modelled detector FWHM is 1.4 keV — the exact
+    situation the doublet logic exists for. Line strengths follow an equal-activity
+    natural-uranium assumption (A(U-235)/A(U-238) = 4.6%), so the U-235 line
+    carries 0.0264 photon/decay against 0.0364 for Ra-226.
+    """
+
+    rng = np.random.default_rng(seed)
+    channels = np.arange(16384, dtype=float)
+    continuum = 6.0 + 260.0 * np.exp(-channels / 700.0)
+    sigma_channels = (DOUBLET_FWHM_KEV / 2.35482) / DOUBLET_SLOPE_KEV_PER_CHANNEL
+    expected = continuum.copy()
+    for energy, emission_per_decay in (
+        (185.715, 0.572 * 0.046),
+        (186.211, 0.0364),
+        (241.997, 0.0727),
+        (295.224, 0.193),
+        (351.932, 0.376),
+        (609.312, 0.457),
+    ):
+        center = (energy - DOUBLET_OFFSET_KEV) / DOUBLET_SLOPE_KEV_PER_CHANNEL
+        amplitude = 60000.0 * emission_per_decay / (sigma_channels * np.sqrt(2.0 * np.pi))
+        expected += amplitude * np.exp(-0.5 * ((channels - center) / sigma_channels) ** 2)
+    counts = rng.poisson(np.clip(expected, 0, None)).astype(float)
+    return SpectrumRecord(
+        filepath="synthetic-doublet.spe",
+        channels=channels,
+        counts=counts,
+        live_time=1800.0,
+        real_time=1815.0,
+    )
+
 
 def synthetic_co60_record(seed: int = 2025) -> SpectrumRecord:
     """Create a clearly labeled synthetic Co-60-like teaching spectrum."""
@@ -109,6 +150,7 @@ def main() -> None:
     print(write_spe(synthetic_co60_record(), destination / "synthetic_co60.spe"))
     print(write_spe(synthetic_sample_with_k40_record(), destination / "synthetic_sample_with_k40.spe"))
     print(write_spe(synthetic_lab_background_record(), destination / "synthetic_lab_background.spe"))
+    print(write_spe(synthetic_doublet_record(), destination / "synthetic_doublet.spe"))
 
 
 if __name__ == "__main__":
