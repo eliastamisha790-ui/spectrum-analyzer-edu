@@ -6,6 +6,7 @@ import datetime
 import json
 import os
 import sys
+import dataclasses
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -16,6 +17,7 @@ import pyqtgraph as pg
 from .core import (
     ActivitySummary,
     AnalysisConfig,
+    BackgroundInfo,
     CalibrationModel,
     EfficiencyModel,
     EfficiencyPoint,
@@ -35,6 +37,7 @@ from .core import (
     refine_peaks,
     smooth_spectrum,
     snip_baseline,
+    subtract_background,
     summarize_nuclide_matches,
     validate_nuclide_library,
 )
@@ -133,7 +136,7 @@ class AnalysisSettingsDialog(QtWidgets.QDialog):
         super().__init__(parent)
         self.setWindowTitle("分析参数")
         self.setModal(True)
-        self.resize(500, 420)
+        self.resize(520, 500)
         layout = QtWidgets.QVBoxLayout(self)
         tip = QtWidgets.QLabel("参数需要根据探测器分辨率、道数和计数统计调整；默认值适合一般教学示例。")
         tip.setWordWrap(True)
@@ -183,6 +186,20 @@ class AnalysisSettingsDialog(QtWidgets.QDialog):
         self.candidates_spin.setValue(config.max_candidates)
         form.addRow("每峰候选上限", self.candidates_spin)
 
+        self.width_tolerance_spin = QtWidgets.QDoubleSpinBox()
+        self.width_tolerance_spin.setRange(0.0, 5.0)
+        self.width_tolerance_spin.setSingleStep(0.1)
+        self.width_tolerance_spin.setDecimals(2)
+        self.width_tolerance_spin.setValue(config.width_tolerance_factor)
+        form.addRow("容差按 FWHM 放宽(倍)", self.width_tolerance_spin)
+
+        self.interference_spin = QtWidgets.QDoubleSpinBox()
+        self.interference_spin.setRange(0.0, 10.0)
+        self.interference_spin.setSingleStep(0.1)
+        self.interference_spin.setDecimals(2)
+        self.interference_spin.setValue(config.interference_width_factor)
+        form.addRow("双线判定宽度(倍 FWHM)", self.interference_spin)
+
         layout.addLayout(form)
         buttons = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.RestoreDefaults
@@ -205,6 +222,8 @@ class AnalysisSettingsDialog(QtWidgets.QDialog):
         self.absolute_tolerance_spin.setValue(defaults.absolute_tolerance_kev)
         self.relative_tolerance_spin.setValue(defaults.relative_tolerance * 100.0)
         self.candidates_spin.setValue(defaults.max_candidates)
+        self.width_tolerance_spin.setValue(defaults.width_tolerance_factor)
+        self.interference_spin.setValue(defaults.interference_width_factor)
 
     def accept(self) -> None:
         try:
@@ -218,6 +237,10 @@ class AnalysisSettingsDialog(QtWidgets.QDialog):
                 absolute_tolerance_kev=self.absolute_tolerance_spin.value(),
                 relative_tolerance=self.relative_tolerance_spin.value() / 100.0,
                 max_candidates=self.candidates_spin.value(),
+                width_tolerance_factor=self.width_tolerance_spin.value(),
+                interference_width_factor=self.interference_spin.value(),
+                background_scale=self._config.background_scale,
+                snip_after_background=self._config.snip_after_background,
             ).validated()
         except ValueError as exc:
             QtWidgets.QMessageBox.warning(self, "参数无效", str(exc))
@@ -448,10 +471,13 @@ class AxisLockedViewBox(pg.ViewBox):
 class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("能谱分析工作台 v0.3")
+        self.setWindowTitle("能谱分析工作台 v0.4")
         self.resize(1280, 760)
         self.current_spectrum: Optional[SpectrumRecord] = None
+        self.background_spectrum: Optional[SpectrumRecord] = None
+        self.background_info: Optional[BackgroundInfo] = None
         self.net_counts: Optional[np.ndarray] = None
+        self.analysis_counts: Optional[np.ndarray] = None
         self.smoothed_counts: Optional[np.ndarray] = None
         self.smoothed_net_counts: Optional[np.ndarray] = None
         self.peaks: List[PeakResult] = []
@@ -520,6 +546,7 @@ class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
         ribbon_layout.addLayout(info_block, 2)
 
         self.load_btn = QtWidgets.QPushButton("导入谱文件")
+        self.background_btn = QtWidgets.QPushButton("导入本底谱")
         self.demo_btn = QtWidgets.QPushButton("加载合成示例")
         self.calibrate_btn = QtWidgets.QPushButton("能量刻度")
         self.efficiency_btn = QtWidgets.QPushButton("效率刻度")
@@ -528,6 +555,7 @@ class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
         self.report_btn = QtWidgets.QPushButton("导出报告")
         buttons = (
             self.load_btn,
+            self.background_btn,
             self.demo_btn,
             self.calibrate_btn,
             self.efficiency_btn,
@@ -582,8 +610,12 @@ class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
         self.raw_curve = self.plot_widget.plot([], [], pen=pg.mkPen("#5ac8fa", width=1.2), name="原始谱")
         self.smooth_curve = self.plot_widget.plot([], [], pen=pg.mkPen("#30d158", width=1.1), name="平滑辅助")
         self.net_curve = self.plot_widget.plot([], [], pen=pg.mkPen("#ff9500", width=1.0, style=QtCore.Qt.DashLine), name="净谱")
+        self.background_curve = self.plot_widget.plot(
+            [], [], pen=pg.mkPen("#9a9aa8", width=1.0, style=QtCore.Qt.DotLine), name="本底谱"
+        )
         self.smooth_curve.hide()
         self.net_curve.hide()
+        self.background_curve.hide()
         self.v_line = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#ffffff80"))
         self.h_line = pg.InfiniteLine(angle=0, movable=False, pen=pg.mkPen("#ffffff40"))
         self.plot_widget.addItem(self.v_line, ignoreBounds=True)
@@ -620,7 +652,7 @@ class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
         self.peaks_table = QtWidgets.QTableWidget(0, 7)
         self.peaks_table.setHorizontalHeaderLabels(["峰道址", "能量(keV)", "峰面积", "半高宽", "核素候选", "匹配分数", "活度估算"])
         self.peaks_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Interactive)
-        for column, width in enumerate((65, 82, 75, 70, 125, 75, 70)):
+        for column, width in enumerate((60, 78, 70, 64, 150, 74, 64)):
             self.peaks_table.setColumnWidth(column, width)
         self.peaks_table.setMinimumHeight(155)
         self.peaks_table.verticalHeader().setVisible(False)
@@ -668,6 +700,7 @@ class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
         self.statusBar().showMessage("教学/科研原型：结果仅供参考，不可替代经检定的测量软件")
 
         self.load_btn.clicked.connect(self.load_spectrum)
+        self.background_btn.clicked.connect(self.import_background_spectrum)
         self.demo_btn.clicked.connect(self.load_demo_spectrum)
         self.calibrate_btn.clicked.connect(self.open_calibration_dialog)
         self.efficiency_btn.clicked.connect(self.open_efficiency_calibration_dialog)
@@ -687,6 +720,20 @@ class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
         configuration_menu.addSeparator()
         self.import_library_action = configuration_menu.addAction("导入核素库…")
         self.restore_library_action = configuration_menu.addAction("恢复内置教学库")
+        configuration_menu.addSeparator()
+        self.import_background_action = configuration_menu.addAction("导入实测本底谱…")
+        self.clear_background_action = configuration_menu.addAction("移除本底谱")
+        self.background_scale_menu = configuration_menu.addMenu("本底归一方式")
+        self.background_scale_group = QtWidgets.QActionGroup(self)
+        for label, value in (("按活时间比", "live"), ("按实时间比", "real"), ("不归一 (1:1)", "none")):
+            action = self.background_scale_menu.addAction(label)
+            action.setCheckable(True)
+            action.setData(value)
+            action.setChecked(value == self.analysis_config.background_scale)
+            self.background_scale_group.addAction(action)
+        self.snip_after_background_action = configuration_menu.addAction("扣除本底后仍做 SNIP 估计")
+        self.snip_after_background_action.setCheckable(True)
+        self.snip_after_background_action.setChecked(True)
 
         calibration_menu = self.menuBar().addMenu("刻度")
         self.manual_calibration_action = calibration_menu.addAction("自定义刻度点…")
@@ -699,6 +746,10 @@ class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
         self.analysis_settings_action.triggered.connect(self.open_analysis_settings_dialog)
         self.import_library_action.triggered.connect(self.import_nuclide_library)
         self.restore_library_action.triggered.connect(self.restore_builtin_library)
+        self.import_background_action.triggered.connect(self.import_background_spectrum)
+        self.clear_background_action.triggered.connect(self.clear_background_spectrum)
+        self.snip_after_background_action.toggled.connect(self._handle_background_snip_toggled)
+        self.background_scale_group.triggered.connect(self._handle_background_scale_changed)
         self.manual_calibration_action.triggered.connect(self.open_manual_calibration_dialog)
         self.import_calibration_action.triggered.connect(self.import_energy_calibration)
         self.export_calibration_action.triggered.connect(self.export_energy_calibration)
@@ -728,6 +779,131 @@ class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
         self._update_info_label()
         self._update_peak_table()
         self.statusBar().showMessage(f"已加载 {os.path.basename(filepath)}")
+
+    def import_background_spectrum(self) -> None:
+        """Load a measured background and subtract it from the current sample."""
+
+        if not self.current_spectrum:
+            QtWidgets.QMessageBox.information(self, "提示", "请先导入样品谱，再导入本底谱。")
+            return
+        filepath, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "选择实测本底谱",
+            BASE_DIR,
+            SPECTRUM_FILE_FILTER,
+        )
+        if not filepath:
+            return
+        try:
+            background = load_spectrum_file(filepath)
+        except ValueError as exc:
+            QtWidgets.QMessageBox.warning(self, "导入失败", str(exc))
+            return
+        try:
+            self.set_background(background)
+        except ValueError as exc:
+            QtWidgets.QMessageBox.warning(self, "本底不兼容", str(exc))
+            return
+        self.statusBar().showMessage(
+            f"已载入本底谱 {os.path.basename(filepath)}"
+            f"（{self.background_info.describe_scale()} ×{self.background_info.scale:.3f}）"
+        )
+
+    def set_background(self, background: SpectrumRecord) -> None:
+        """Attach a measured background spectrum and re-run the analysis."""
+
+        if not self.current_spectrum:
+            raise ValueError("请先导入样品谱，再导入本底谱。")
+        _, info = subtract_background(
+            self.current_spectrum,
+            background,
+            scale_mode=self.analysis_config.background_scale,
+        )
+        self.background_spectrum = background
+        self.background_info = info
+        self._reset_analysis_state()
+        self._update_plot()
+        self._update_info_label()
+        self.activity_status_message = "本底谱已更新，请重新分析"
+        self._update_activity_summary_table()
+        self._update_peak_table()
+        self.run_analysis()
+
+    def clear_background_spectrum(self) -> None:
+        if self.background_spectrum is None:
+            return
+        self.background_spectrum = None
+        self.background_info = None
+        self._reset_analysis_state()
+        self._update_plot()
+        self._update_info_label()
+        self._update_peak_table()
+        self.statusBar().showMessage("已移除本底谱，恢复 SNIP 自动本底估计")
+        if self.current_spectrum:
+            self.run_analysis()
+
+    def _handle_background_snip_toggled(self, checked: bool) -> None:
+        self.analysis_config = dataclasses.replace(self.analysis_config, snip_after_background=bool(checked))
+        self.net_counts = None
+        self.smoothed_net_counts = None
+        if not self.current_spectrum:
+            return
+        self._update_plot()
+        self._update_info_label()
+        if self.peaks:
+            self.run_analysis()
+        self.statusBar().showMessage(
+            "扣除本底后仍做 SNIP：%s" % ("开启" if checked else "关闭")
+        )
+
+    def _handle_background_scale_changed(self, action: QtWidgets.QAction) -> None:
+        value = action.data()
+        if value == self.analysis_config.background_scale:
+            return
+        self.analysis_config = dataclasses.replace(self.analysis_config, background_scale=value)
+        self.net_counts = None
+        self.smoothed_net_counts = None
+        if not self.current_spectrum:
+            return
+        self._update_plot()
+        self._update_info_label()
+        if self.peaks:
+            self.run_analysis()
+        self.statusBar().showMessage(f"本底归一方式已切换为：{action.text()}")
+
+    def _prepare_analysis_counts(self) -> Optional[np.ndarray]:
+        """Counts that enter peak finding: sample minus normalized background."""
+
+        if not self.current_spectrum:
+            return None
+        if self.background_spectrum is None:
+            self.background_info = None
+            self.analysis_counts = self.current_spectrum.counts
+            return self.analysis_counts
+        record, info = subtract_background(
+            self.current_spectrum,
+            self.background_spectrum,
+            scale_mode=self.analysis_config.background_scale,
+        )
+        self.background_info = info
+        self.analysis_counts = record.counts
+        return self.analysis_counts
+
+    def _background_display_counts(self) -> Optional[np.ndarray]:
+        """Background counts scaled onto the sample grid, for the plot overlay."""
+
+        if self.background_spectrum is None or not self.current_spectrum:
+            return None
+        background = self.background_spectrum
+        scale = self.background_info.scale if self.background_info else 1.0
+        sample_channels = self.current_spectrum.channels
+        if len(background.channels) == len(sample_channels) and np.allclose(
+            background.channels, sample_channels, rtol=0.0, atol=1e-6
+        ):
+            counts = background.counts
+        else:
+            counts = np.interp(sample_channels, background.channels, background.counts, left=0.0, right=0.0)
+        return np.asarray(counts, dtype=float) * float(scale)
 
     def load_demo_spectrum(self) -> None:
         """Load a deterministic synthetic spectrum without using external data."""
@@ -874,6 +1050,7 @@ class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
 
     def _reset_analysis_state(self) -> None:
         self.net_counts = None
+        self.analysis_counts = None
         self.smoothed_counts = None
         self.smoothed_net_counts = None
         self.peaks.clear()
@@ -935,12 +1112,23 @@ class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "提示", "未导入谱文件。")
             return None
         if self.net_counts is None:
-            self.statusBar().showMessage("正在执行 SNIP 本底扣除…")
-            baseline = snip_baseline(
-                self.current_spectrum.counts,
-                iterations=self.analysis_config.snip_iterations,
-            )
-            self.net_counts = np.clip(self.current_spectrum.counts - baseline, 0, None)
+            try:
+                counts = self._prepare_analysis_counts()
+            except ValueError as exc:
+                QtWidgets.QMessageBox.warning(self, "本底扣除失败", str(exc))
+                return None
+            if counts is None:
+                return None
+            if self.background_info is not None and not self.snip_after_background_action.isChecked():
+                baseline = np.zeros_like(counts)
+                self.background_info.continuum = "none"
+                self.statusBar().showMessage("实测本底扣除完成（未做 SNIP 估计）")
+            else:
+                self.statusBar().showMessage("正在执行 SNIP 本底扣除…")
+                baseline = snip_baseline(counts, iterations=self.analysis_config.snip_iterations)
+                if self.background_info is not None:
+                    self.background_info.continuum = "snip"
+            self.net_counts = np.clip(counts - baseline, 0, None)
             self.smoothed_net_counts = None
             self.net_curve.show()
             self.net_curve.setData(self.current_spectrum.channels, self.net_counts)
@@ -974,12 +1162,15 @@ class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
             absolute_tolerance_kev=self.analysis_config.absolute_tolerance_kev,
             relative_tolerance=self.analysis_config.relative_tolerance,
             max_candidates=self.analysis_config.max_candidates,
+            width_tolerance_factor=self.analysis_config.width_tolerance_factor,
+            interference_width_factor=self.analysis_config.interference_width_factor,
         )
         self.nuclide_summary = summarize_nuclide_matches(
             peaks,
             self.nuclide_library,
             absolute_tolerance_kev=self.analysis_config.absolute_tolerance_kev,
             relative_tolerance=self.analysis_config.relative_tolerance,
+            width_tolerance_factor=self.analysis_config.width_tolerance_factor,
         )
 
     def _close_peak_dialog(self) -> None:
@@ -1065,14 +1256,22 @@ class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
             return
         counts = self.current_spectrum.counts
         for peak in self.peaks:
+            if not peak.is_ambiguous and not peak.nuclide_candidates:
+                continue
             idx = self._nearest_channel_index(peak.channel)
             y = counts[idx]
             text_lines = [f"{peak.energy:.1f} keV"]
-            if peak.nuclide_candidates:
+            if peak.is_ambiguous:
+                text_lines.append(" + ".join(line.isotope for line in peak.interference[:2]) + " 双线")
+            elif peak.nuclide_candidates:
                 text_lines.append(peak.nuclide_candidates[0])
             if peak.confidence > 0:
-                text_lines.append(f"匹配分数 {peak.confidence * 100:.1f}%")
-            label = pg.TextItem("\n".join(text_lines), color="#ffd60a" if peak.nuclide_candidates else "#d8dee9")
+                suffix = "†" if peak.is_ambiguous else ""
+                text_lines.append(f"匹配分数 {peak.confidence * 100:.1f}%{suffix}")
+            label = pg.TextItem(
+                "\n".join(text_lines),
+                color="#ff9f0a" if peak.is_ambiguous else ("#ffd60a" if peak.nuclide_candidates else "#d8dee9"),
+            )
             label.setAnchor((0.5, 1.2))
             label.setPos(peak.channel, y)
             self.plot_widget.addItem(label)
@@ -1322,6 +1521,7 @@ class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
         self.peaks = peaks
         self._recalculate_activity_analysis()
         self._update_peak_table()
+        self._update_info_label()
         self.statusBar().showMessage(f"已识别 {len(peaks)} 个峰")
 
     def open_calibration_dialog(self) -> None:
@@ -1464,6 +1664,20 @@ class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
         QtWidgets.QMessageBox.information(self, "效率刻度", message)
         self.statusBar().showMessage(f"效率刻度完成，{len(valid_points)} 个点")
 
+    def _background_report_text(self) -> str:
+        info = self.background_info
+        if self.background_spectrum is None or info is None:
+            return "未使用（连续本底由 SNIP 自动估计）"
+        parts = [
+            os.path.basename(info.filepath),
+            info.describe_scale(),
+            f"×{info.scale:.4f}",
+            "道址已重采样" if info.resampled else "道址一致",
+            f"截断通道 {info.clipped_channels} ({info.clipped_fraction * 100:.1f}%)",
+            "扣除后仍做 SNIP 估计" if info.continuum == "snip" else "扣除后不再做 SNIP 估计",
+        ]
+        return " | ".join(parts)
+
     def export_report(self) -> None:
         if not self.current_spectrum or not self.peaks:
             QtWidgets.QMessageBox.warning(self, "提示", "请先分析并确认峰。")
@@ -1480,6 +1694,16 @@ class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
             return
         if not filename.lower().endswith(".txt"):
             filename += ".txt"
+        with open(filename, "w", encoding="utf-8") as handle:
+            handle.write(self.build_report_text())
+        QtWidgets.QMessageBox.information(self, "导出完成", f"已导出: {filename}")
+        self.statusBar().showMessage(f"已导出 {filename}")
+
+    def build_report_text(self) -> str:
+        """Render the plain-text report without touching the file system."""
+
+        if not self.current_spectrum:
+            return ""
         lines = [
             "谱线分析报告",
             "=" * 40,
@@ -1492,23 +1716,46 @@ class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
             f"分析参数: {json.dumps(self.analysis_config.as_dict(), ensure_ascii=False)}",
             f"平滑辅助: {'开启' if self._smoothing_enabled() else '关闭'}"
             + (f" (窗口 {self._smoothing_window()})" if self._smoothing_enabled() else ""),
+            f"实测本底: {self._background_report_text()}",
             "",
             "峰值信息:",
         ]
         if self.current_spectrum.warnings:
             lines.insert(8, "导入警告: " + "；".join(self.current_spectrum.warnings))
         for idx, peak in enumerate(self.peaks, 1):
+            candidate_text = (
+                " + ".join(f"{line.isotope}({line.energy:.1f})" for line in peak.interference)
+                if peak.is_ambiguous
+                else (", ".join(peak.nuclide_candidates) or "—")
+            )
+            confidence_text = f"匹配分数 {peak.confidence * 100:.1f}%"
+            if peak.is_ambiguous:
+                confidence_text = "匹配分数 —（双线不可分辨）"
             lines.append(
                 f"[{idx}] 通道 {peak.channel:.1f}	能量 {peak.energy:.2f} keV	面积 {peak.area:.1f}	"
-                f"FWHM {peak.fwhm:.2f}	候选 {', '.join(peak.nuclide_candidates) or '—'}	"
-                f"匹配分数 {peak.confidence * 100:.1f}%	活度 {format_activity(peak.activity_bq)}"
+                f"FWHM {peak.fwhm:.2f} ch / {peak.fwhm_kev:.2f} keV	候选 {candidate_text}	"
+                f"{confidence_text}	活度 {format_activity(peak.activity_bq)}"
             )
+        ambiguous_peaks = [peak for peak in self.peaks if peak.is_ambiguous]
+        if ambiguous_peaks:
+            lines.append("")
+            lines.append("双线 / 干扰说明（标准为“库内两条参考线间距小于本峰 FWHM，本次未指定主核素”）:")
+            for peak in ambiguous_peaks:
+                detail = " / ".join(
+                    f"{line.isotope} {line.energy:.3f} keV（Δ={line.delta_kev:+.3f}，等活度发射概率份额 {line.weight * 100:.0f}%）"
+                    for line in peak.interference
+                )
+                lines.append(
+                    f"  {peak.energy:.2f} keV（FWHM {peak.fwhm_kev:.2f} keV）：{detail}"
+                )
+            lines.append("  → 该峰的活度与核素归属需用其他谱线或更高分辨率复测来确认，软件不做强行指派。")
         if self.nuclide_summary:
             lines.append("")
             lines.append("整谱核素候选（启发式）:")
             for item in self.nuclide_summary[:8]:
+                ambiguous_note = f"（含 {item.ambiguous_lines} 条双线）" if item.ambiguous_lines else ""
                 lines.append(
-                    f"  {item.isotope} | 匹配线 {item.matched_lines}/{item.total_lines} | "
+                    f"  {item.isotope} | 匹配线 {item.matched_lines}/{item.total_lines}{ambiguous_note} | "
                     f"强度覆盖 {item.intensity_coverage * 100:.1f}% | 谱级分数 {item.match_score * 100:.1f}%"
                 )
         if self.efficiency_points:
@@ -1530,14 +1777,13 @@ class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
                 "",
                 "限制声明:",
                 "  本软件为教学/科研原型，核素候选和匹配分数仅供人工复核。",
+                "  实测本底按时间归一后逐道相减，负值截断到 0；该截断与峰面积的不确定度均未传播。",
+                "  双线（†）峰不指定主核素、不计算活度，需用其他谱线或更高分辨率复测确认。",
                 "  活度为基于输入效率曲线的估算值，未自动校正衰变、几何、自吸收或符合相加效应。",
                 "  不得将输出用于安全、医疗、监管或环境合规决策。",
             ]
         )
-        with open(filename, "w", encoding="utf-8") as handle:
-            handle.write("\n".join(lines))
-        QtWidgets.QMessageBox.information(self, "导出完成", f"已导出: {filename}")
-        self.statusBar().showMessage(f"已导出 {filename}")
+        return "\n".join(lines)
 
     # ---------------- UI 辅助 ----------------
     def _update_plot(self) -> None:
@@ -1545,8 +1791,10 @@ class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
             self.raw_curve.setData([], [])
             self.smooth_curve.setData([], [])
             self.net_curve.setData([], [])
+            self.background_curve.setData([], [])
             self.smooth_curve.hide()
             self.net_curve.hide()
+            self.background_curve.hide()
             if self.view_box:
                 self.view_box.setAspectLocked(False)
                 self.view_box.setLimits(xMin=None, xMax=None, yMin=None, yMax=None)
@@ -1565,6 +1813,13 @@ class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
         else:
             self.net_curve.hide()
             self.net_curve.setData([], [])
+        background_display = self._background_display_counts()
+        if background_display is not None:
+            self.background_curve.show()
+            self.background_curve.setData(self.current_spectrum.channels, background_display)
+        else:
+            self.background_curve.hide()
+            self.background_curve.setData([], [])
         self._update_view_limits()
 
     def _update_info_label(self) -> None:
@@ -1578,8 +1833,15 @@ class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
         if self._smoothing_enabled():
             smoothing_text += f" (窗口 {self._smoothing_window()})"
         warning_text = f"\n导入警告: {self.current_spectrum.warnings[0]}" if self.current_spectrum.warnings else ""
+        background_text = "无（使用 SNIP 自动估计）"
+        if self.background_spectrum is not None and self.background_info is not None:
+            background_text = (
+                f"已扣除 {os.path.basename(self.background_spectrum.filepath)}"
+                f"（{self.background_info.describe_scale()} ×{self.background_info.scale:.3f}）"
+            )
         self.info_label.setText(
             f"当前文件: {name}\n实时间/活时间: {rt} / {lt}\n"
+            f"本底: {background_text}\n"
             f"核素库: {self.library_source}｜平滑辅助: {smoothing_text}{warning_text}"
         )
 
@@ -1590,6 +1852,7 @@ class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
             self.peaks_table.insertRow(row)
             for col, value in enumerate(peak.as_row()):
                 item = QtWidgets.QTableWidgetItem(value)
+                item.setToolTip(value)
                 self.peaks_table.setItem(row, col, item)
         self._update_peak_annotations()
         self._update_identification_summary_table()
@@ -1604,7 +1867,8 @@ class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
             self.identification_table.insertRow(row)
             values = (
                 summary.isotope,
-                f"{summary.matched_lines}/{summary.total_lines}",
+                f"{summary.matched_lines}/{summary.total_lines}"
+                + (f" (含 {summary.ambiguous_lines}†)" if summary.ambiguous_lines else ""),
                 f"{summary.intensity_coverage * 100:.1f}%",
                 f"{summary.match_score * 100:.1f}%",
             )

@@ -136,6 +136,72 @@ NNDC_LIBRARY: Dict[str, List[Dict[str, float]]] = {
   ],
   "zn-65": [
     {"energy": 1115.546, "intensity": 0.506}
+  ],
+  # --- 天然放射性核素（U-238 系 / Th-232 系 / K-40）---
+  # 参考线与发射概率取自 ENSDF（经 NuDat 3 复核），仅收录教学与筛查常用的
+  # 主线；强度为每次衰变的绝对发射概率（γ/衰变）。
+  # 注意：u-235 的 185.715 keV 与 ra-226 的 186.211 keV 在常规 HPGe/NaI 分辨率
+  # 下不可分辨，二者必须由 match_nuclides 的双线逻辑标注，不能单独认领。
+  "u-235": [
+    {"energy": 143.76, "intensity": 0.1096},
+    {"energy": 163.33, "intensity": 0.0508},
+    {"energy": 185.715, "intensity": 0.572},
+    {"energy": 205.31, "intensity": 0.0501}
+  ],
+  "ra-226": [
+    {"energy": 186.211, "intensity": 0.0364}
+  ],
+  "pb-210": [
+    {"energy": 46.539, "intensity": 0.0425}
+  ],
+  "th-234": [
+    {"energy": 63.29, "intensity": 0.048},
+    {"energy": 92.38, "intensity": 0.0281}
+  ],
+  "pb-214": [
+    {"energy": 241.997, "intensity": 0.0727},
+    {"energy": 295.224, "intensity": 0.193},
+    {"energy": 351.932, "intensity": 0.376}
+  ],
+  "bi-214": [
+    {"energy": 609.312, "intensity": 0.457},
+    {"energy": 665.453, "intensity": 0.0151},
+    {"energy": 768.357, "intensity": 0.0489},
+    {"energy": 806.174, "intensity": 0.0121},
+    {"energy": 934.061, "intensity": 0.0316},
+    {"energy": 1120.294, "intensity": 0.151},
+    {"energy": 1155.19, "intensity": 0.0163},
+    {"energy": 1238.111, "intensity": 0.0594},
+    {"energy": 1280.96, "intensity": 0.0143},
+    {"energy": 1377.669, "intensity": 0.04},
+    {"energy": 1407.98, "intensity": 0.0215},
+    {"energy": 1661.28, "intensity": 0.0115},
+    {"energy": 1729.6, "intensity": 0.029},
+    {"energy": 1764.494, "intensity": 0.154},
+    {"energy": 2118.55, "intensity": 0.0116},
+    {"energy": 2204.21, "intensity": 0.049}
+  ],
+  "ac-228": [
+    {"energy": 209.253, "intensity": 0.039},
+    {"energy": 338.32, "intensity": 0.114},
+    {"energy": 794.947, "intensity": 0.043},
+    {"energy": 911.204, "intensity": 0.262},
+    {"energy": 964.766, "intensity": 0.0499},
+    {"energy": 968.971, "intensity": 0.162}
+  ],
+  "pb-212": [
+    {"energy": 238.632, "intensity": 0.436},
+    {"energy": 300.087, "intensity": 0.033}
+  ],
+  "bi-212": [
+    {"energy": 727.33, "intensity": 0.0658},
+    {"energy": 1620.5, "intensity": 0.0149}
+  ],
+  "tl-208": [
+    {"energy": 510.77, "intensity": 0.226},
+    {"energy": 583.187, "intensity": 0.85},
+    {"energy": 860.53, "intensity": 0.125},
+    {"energy": 2614.511, "intensity": 0.9975}
   ]
 }
 
@@ -236,6 +302,17 @@ class SpectrumRecord:
 
 
 @dataclass
+class InterferenceLine:
+    """One reference line that cannot be separated from a neighbouring line."""
+
+    isotope: str
+    energy: float
+    intensity: float
+    delta_kev: float
+    weight: float
+
+
+@dataclass
 class PeakResult:
     channel: float
     fwhm: float
@@ -247,16 +324,38 @@ class PeakResult:
     primary_isotope: str = ""
     reference_intensity: float = 0.0
     activity_bq: Optional[float] = None
+    interference: List[InterferenceLine] = field(default_factory=list)
+    fwhm_kev: float = 0.0
+
+    @property
+    def is_ambiguous(self) -> bool:
+        """True when two or more reference lines share this peak within its FWHM."""
+
+        return len({line.isotope for line in self.interference}) > 1
+
+    def interference_text(self) -> str:
+        if not self.is_ambiguous:
+            return ""
+        return " / ".join(
+            f"{line.isotope}({line.energy:.1f}, {line.weight * 100:.0f}%)" for line in self.interference
+        )
 
     def as_row(self) -> List[str]:
         activity = format_activity(self.activity_bq)
+        if self.is_ambiguous:
+            candidate_text = "† " + " + ".join(
+                f"{line.isotope}({line.energy:.1f})" for line in self.interference[:3]
+            )
+        else:
+            candidate_text = ", ".join(self.nuclide_candidates) if self.nuclide_candidates else "—"
+        confidence_text = f"{self.confidence * 100:.1f}%" + ("†" if self.is_ambiguous else "")
         return [
             f"{self.channel:.1f}",
             f"{self.energy:.2f}",
             f"{self.area:.1f}",
             f"{self.fwhm:.2f}",
-            ", ".join(self.nuclide_candidates) if self.nuclide_candidates else "—",
-            f"{self.confidence * 100:.1f}%",
+            candidate_text,
+            confidence_text,
             activity,
         ]
 
@@ -286,6 +385,25 @@ class NuclideMatchSummary:
     total_lines: int
     intensity_coverage: float
     match_score: float
+    ambiguous_lines: int = 0
+
+
+@dataclass
+class BackgroundInfo:
+    """Provenance for a measured-background subtraction."""
+
+    filepath: str
+    scale_mode: str
+    scale: float
+    resampled: bool
+    clipped_channels: int
+    clipped_fraction: float
+    continuum: str = "snip"
+    warnings: List[str] = field(default_factory=list)
+
+    def describe_scale(self) -> str:
+        labels = {"live": "活时间归一", "real": "实时间归一", "none": "不做时间归一"}
+        return labels.get(self.scale_mode, self.scale_mode)
 
 
 @dataclass
@@ -294,6 +412,8 @@ class AnalysisResult:
     net_counts: np.ndarray
     peaks: List[PeakResult]
     nuclide_summary: List[NuclideMatchSummary] = field(default_factory=list)
+    background: Optional[BackgroundInfo] = None
+    analysis_counts: Optional[np.ndarray] = None
 
 
 @dataclass(frozen=True)
@@ -308,6 +428,10 @@ class AnalysisConfig:
     absolute_tolerance_kev: float = 0.5
     relative_tolerance: float = 0.002
     max_candidates: int = 3
+    width_tolerance_factor: float = 0.5
+    interference_width_factor: float = 1.0
+    background_scale: str = "live"
+    snip_after_background: bool = True
 
     def validated(self) -> "AnalysisConfig":
         if self.snip_iterations is not None and not 1 <= int(self.snip_iterations) <= 4096:
@@ -326,6 +450,12 @@ class AnalysisConfig:
             raise ValueError("相对匹配容差必须是非负有限值。")
         if not 1 <= int(self.max_candidates) <= 20:
             raise ValueError("候选核素数量必须在 1 到 20 之间。")
+        if not math.isfinite(self.width_tolerance_factor) or not 0.0 <= self.width_tolerance_factor <= 5.0:
+            raise ValueError("峰宽容差系数必须在 0 到 5 之间。")
+        if not math.isfinite(self.interference_width_factor) or not 0.0 <= self.interference_width_factor <= 10.0:
+            raise ValueError("双线判定系数必须在 0 到 10 之间。")
+        if self.background_scale not in {"live", "real", "none"}:
+            raise ValueError("本底归一方式必须是 live、real 或 none。")
         return self
 
     def as_dict(self) -> Dict[str, object]:
@@ -338,6 +468,10 @@ class AnalysisConfig:
             "absolute_tolerance_kev": self.absolute_tolerance_kev,
             "relative_tolerance": self.relative_tolerance,
             "max_candidates": self.max_candidates,
+            "width_tolerance_factor": self.width_tolerance_factor,
+            "interference_width_factor": self.interference_width_factor,
+            "background_scale": self.background_scale,
+            "snip_after_background": self.snip_after_background,
         }
 
 
@@ -364,6 +498,11 @@ class CalibrationModel:
             power = degree - idx
             value += coef * (channel ** power)
         return value
+
+    def slope(self, channel: float, step: float = 0.5) -> float:
+        """Local keV-per-channel derivative, used to convert FWHM to keV."""
+
+        return (self.energy(channel + step) - self.energy(channel - step)) / (2.0 * step)
 
     def describe(self) -> str:
         terms = []
@@ -921,6 +1060,90 @@ def load_spectrum_file(filepath: str) -> SpectrumRecord:
     raise ValueError("暂不支持该文件类型，请选择 SPE、XLSX、CSV 或 TXT 文件。")
 
 
+def subtract_background(
+    record: SpectrumRecord,
+    background: SpectrumRecord,
+    scale_mode: str = "live",
+    floor: float = 0.0,
+) -> Tuple[SpectrumRecord, BackgroundInfo]:
+    """Subtract a measured background spectrum from a sample spectrum.
+
+    The background is normalized to the sample by the live-time (or real-time)
+    ratio before subtraction, so both spectra are compared on the same counting
+    rate basis. A background measured on a different channel grid is linearly
+    resampled onto the sample grid. Channels that would go negative are clipped
+    to ``floor`` and counted as clipped, because this prototype has no
+    uncertainty propagation for negative net counts.
+    """
+
+    if scale_mode not in {"live", "real", "none"}:
+        raise ValueError("本底归一方式必须是 live、real 或 none。")
+
+    sample = _validated_record(record)
+    bg = _validated_record(background)
+    warnings: List[str] = []
+
+    same_grid = (
+        len(sample.channels) == len(bg.channels)
+        and np.allclose(sample.channels, bg.channels, rtol=0.0, atol=1e-6)
+    )
+    if same_grid:
+        bg_counts = bg.counts
+        resampled = False
+    else:
+        if sample.channels[-1] < bg.channels[0] or sample.channels[0] > bg.channels[-1]:
+            raise ValueError("本底谱与样品谱的道址范围没有重叠，无法扣除。")
+        bg_counts = np.interp(sample.channels, bg.channels, bg.counts, left=0.0, right=0.0)
+        resampled = True
+        warnings.append(
+            f"本底谱道址范围与样品谱不同（{len(bg.channels)} 道 → {len(sample.channels)} 道），已线性重采样。"
+        )
+
+    scale = 1.0
+    if scale_mode == "live":
+        if sample.live_time and bg.live_time and sample.live_time > 0 and bg.live_time > 0:
+            scale = float(sample.live_time) / float(bg.live_time)
+        elif sample.real_time and bg.real_time and sample.real_time > 0 and bg.real_time > 0:
+            scale = float(sample.real_time) / float(bg.real_time)
+            warnings.append("本底谱或样品谱缺少活时间，已改用实时间比归一。")
+        else:
+            warnings.append("缺少计时信息，本底谱按 1:1 直接扣除；若测量时间不同会引入系统偏差。")
+    elif scale_mode == "real":
+        if sample.real_time and bg.real_time and sample.real_time > 0 and bg.real_time > 0:
+            scale = float(sample.real_time) / float(bg.real_time)
+        else:
+            warnings.append("缺少实时间信息，本底谱按 1:1 直接扣除。")
+
+    subtracted = sample.counts - bg_counts * scale
+    clipped = int(np.count_nonzero(subtracted < floor))
+    net = np.clip(subtracted, floor, None)
+    clipped_fraction = clipped / max(len(net), 1)
+    if clipped:
+        warnings.append(
+            f"扣除后有 {clipped} 个通道 ({clipped_fraction * 100:.1f}%) 低于 {floor:g}，已截断到下限；"
+            "该部分统计偏差未传播。"
+        )
+
+    info = BackgroundInfo(
+        filepath=bg.filepath,
+        scale_mode=scale_mode,
+        scale=scale,
+        resampled=resampled,
+        clipped_channels=clipped,
+        clipped_fraction=clipped_fraction,
+        warnings=warnings,
+    )
+    result = SpectrumRecord(
+        filepath=sample.filepath,
+        channels=sample.channels,
+        counts=net,
+        real_time=sample.real_time,
+        live_time=sample.live_time,
+        warnings=list(sample.warnings) + warnings,
+    )
+    return result, info
+
+
 def snip_baseline(counts: np.ndarray, iterations: Optional[int] = None) -> np.ndarray:
     spec = np.log(np.clip(counts, 1, None))
     baseline = spec.copy()
@@ -1053,7 +1276,20 @@ def match_nuclides(
     absolute_tolerance_kev: float = 0.5,
     relative_tolerance: float = 0.002,
     max_candidates: int = 3,
+    width_tolerance_factor: float = 0.5,
+    interference_width_factor: float = 1.0,
 ) -> None:
+    """Match peaks against reference lines and flag unresolved doublets.
+
+    A tolerance floor of ``width_tolerance_factor * FWHM`` is applied on top of the
+    fixed keV/relative tolerances so that a well-resolved peak on a coarse detector
+    is not rejected for being a fraction of a line width away from the tabulated
+    energy. When two reference lines from different nuclides fall inside
+    ``interference_width_factor * FWHM`` around the same peak, the peak is marked
+    as an unresolved doublet: no single primary isotope is asserted, because doing
+    so would attribute a blended centroid to one nuclide.
+    """
+
     if not peaks:
         return
     for peak in peaks:
@@ -1061,7 +1297,14 @@ def match_nuclides(
         peak.energy = energy
         peak.primary_isotope = ""
         peak.reference_intensity = 0.0
-        tolerance = max(float(absolute_tolerance_kev), energy * float(relative_tolerance))
+        peak.confidence = 0.0
+        peak.interference = []
+        peak.fwhm_kev = abs(float(peak.fwhm)) * abs(calibration.slope(peak.channel))
+        tolerance = max(
+            float(absolute_tolerance_kev),
+            energy * float(relative_tolerance),
+            float(width_tolerance_factor) * peak.fwhm_kev,
+        )
         matches = []
         for entry in library:
             diff = abs(entry["energy"] - energy)
@@ -1074,15 +1317,32 @@ def match_nuclides(
             f"{entry['isotope']} ({entry['energy']:.1f} keV)"
             for _, __, entry, ___ in matches[: int(max_candidates)]
         ]
-        if matches:
-            norm_diff, _, entry, intensity = matches[0]
-            peak.primary_isotope = str(entry.get("isotope", ""))
-            peak.reference_intensity = float(intensity)
-            confidence = max(0.0, 1.0 - norm_diff)
-            confidence *= 0.6 + 0.4 * min(max(intensity, 0.0), 1.0)
-            peak.confidence = min(confidence, 1.0)
+        if not matches:
+            continue
+        norm_diff, _, best_entry, intensity = matches[0]
+        peak.reference_intensity = float(intensity)
+        confidence = max(0.0, 1.0 - norm_diff)
+        confidence *= 0.6 + 0.4 * min(max(intensity, 0.0), 1.0)
+        peak.confidence = min(confidence, 1.0)
+
+        window = max(float(interference_width_factor) * peak.fwhm_kev, 1e-9)
+        near = [item for item in matches if abs(item[2]["energy"] - best_entry["energy"]) <= window]
+        if len({item[2]["isotope"] for item in near}) > 1:
+            total_intensity = sum(max(item[3], 0.0) for item in near) or 1.0
+            peak.interference = [
+                InterferenceLine(
+                    isotope=str(item[2]["isotope"]),
+                    energy=float(item[2]["energy"]),
+                    intensity=float(item[3]),
+                    delta_kev=float(item[2]["energy"]) - energy,
+                    weight=max(item[3], 0.0) / total_intensity,
+                )
+                for item in sorted(near, key=lambda item: item[2]["energy"])
+            ]
+            peak.primary_isotope = ""
+            peak.reference_intensity = 0.0
         else:
-            peak.confidence = 0.0
+            peak.primary_isotope = str(best_entry.get("isotope", ""))
 
 
 def summarize_nuclide_matches(
@@ -1090,8 +1350,15 @@ def summarize_nuclide_matches(
     library: Dict[str, List[Dict[str, float]]],
     absolute_tolerance_kev: float = 0.5,
     relative_tolerance: float = 0.002,
+    width_tolerance_factor: float = 0.5,
 ) -> List[NuclideMatchSummary]:
-    """Rank spectrum-level candidates using unique line coverage and energy agreement."""
+    """Rank spectrum-level candidates using unique line coverage and energy agreement.
+
+    Peaks marked as unresolved doublets only contribute half of their line
+    intensity, and the affected lines are counted in ``ambiguous_lines`` so that a
+    nuclide supported entirely by blended lines cannot look like a confident
+    identification.
+    """
 
     summaries: List[NuclideMatchSummary] = []
     for isotope, lines in validate_nuclide_library(library).items():
@@ -1099,10 +1366,10 @@ def summarize_nuclide_matches(
         matched_intensity = 0.0
         weighted_quality = 0.0
         matched_lines = 0
+        ambiguous_lines = 0
         used_peak_indexes: set[int] = set()
         for line in sorted(lines, key=lambda item: float(item["intensity"]), reverse=True):
             reference_energy = float(line["energy"])
-            tolerance = max(float(absolute_tolerance_kev), reference_energy * float(relative_tolerance))
             candidates = [
                 (abs(peak.energy - reference_energy), index)
                 for index, peak in enumerate(peaks)
@@ -1111,13 +1378,23 @@ def summarize_nuclide_matches(
             if not candidates:
                 continue
             difference, peak_index = min(candidates)
+            peak_width = float(getattr(peaks[peak_index], "fwhm_kev", 0.0) or 0.0)
+            tolerance = max(
+                float(absolute_tolerance_kev),
+                reference_energy * float(relative_tolerance),
+                float(width_tolerance_factor) * peak_width,
+            )
             if difference > tolerance:
                 continue
             intensity = float(line["intensity"])
+            ambiguous = bool(getattr(peaks[peak_index], "interference", None))
+            credit = 0.5 if ambiguous else 1.0
             used_peak_indexes.add(peak_index)
             matched_lines += 1
-            matched_intensity += intensity
-            weighted_quality += intensity * max(0.0, 1.0 - difference / tolerance)
+            if ambiguous:
+                ambiguous_lines += 1
+            matched_intensity += intensity * credit
+            weighted_quality += intensity * credit * max(0.0, 1.0 - difference / tolerance)
         if not matched_lines or total_intensity <= 0:
             continue
         coverage = min(matched_intensity / total_intensity, 1.0)
@@ -1130,6 +1407,7 @@ def summarize_nuclide_matches(
                 total_lines=len(lines),
                 intensity_coverage=coverage,
                 match_score=min(max(score, 0.0), 1.0),
+                ambiguous_lines=ambiguous_lines,
             )
         )
     return sorted(
@@ -1144,14 +1422,36 @@ def analyze_spectrum(
     calibration: Optional[CalibrationModel] = None,
     library: Optional[Dict[str, List[Dict[str, float]]]] = None,
     config: Optional[AnalysisConfig] = None,
+    background: Optional[SpectrumRecord] = None,
 ) -> AnalysisResult:
-    """Run the reproducible baseline -> peak -> nuclide matching pipeline."""
+    """Run the reproducible background -> baseline -> peak -> nuclide pipeline.
+
+    When ``background`` is given, the measured background is subtracted first and
+    the SNIP continuum estimate then runs on the residual, so environmental lines
+    and the sample's own Compton continuum are handled in that order.
+    """
 
     record = _validated_record(record)
     settings = (config or AnalysisConfig()).validated()
     reference_library = validate_nuclide_library(library or NNDC_LIBRARY)
-    baseline = snip_baseline(record.counts, iterations=settings.snip_iterations)
-    net_counts = np.clip(record.counts - baseline, 0, None)
+    background_info: Optional[BackgroundInfo] = None
+    analysis_counts = record.counts
+    if background is not None:
+        record, background_info = subtract_background(
+            record,
+            background,
+            scale_mode=settings.background_scale,
+        )
+        analysis_counts = record.counts
+        if settings.snip_after_background:
+            baseline = snip_baseline(analysis_counts, iterations=settings.snip_iterations)
+            background_info.continuum = "snip"
+        else:
+            baseline = np.zeros_like(analysis_counts)
+            background_info.continuum = "none"
+    else:
+        baseline = snip_baseline(analysis_counts, iterations=settings.snip_iterations)
+    net_counts = np.clip(analysis_counts - baseline, 0, None)
     candidates = detect_peaks_from_cwt(
         net_counts,
         widths=settings.wavelet_widths,
@@ -1161,7 +1461,7 @@ def analyze_spectrum(
     peaks = refine_peaks(
         record.channels,
         net_counts,
-        record.counts,
+        analysis_counts,
         candidates,
         min_snr=settings.min_snr,
     )
@@ -1173,14 +1473,24 @@ def analyze_spectrum(
         absolute_tolerance_kev=settings.absolute_tolerance_kev,
         relative_tolerance=settings.relative_tolerance,
         max_candidates=settings.max_candidates,
+        width_tolerance_factor=settings.width_tolerance_factor,
+        interference_width_factor=settings.interference_width_factor,
     )
     summary = summarize_nuclide_matches(
         peaks,
         reference_library,
         absolute_tolerance_kev=settings.absolute_tolerance_kev,
         relative_tolerance=settings.relative_tolerance,
+        width_tolerance_factor=settings.width_tolerance_factor,
     )
-    return AnalysisResult(baseline=baseline, net_counts=net_counts, peaks=peaks, nuclide_summary=summary)
+    return AnalysisResult(
+        baseline=baseline,
+        net_counts=net_counts,
+        peaks=peaks,
+        nuclide_summary=summary,
+        background=background_info,
+        analysis_counts=analysis_counts,
+    )
 
 
 def ensure_directory(path: str) -> None:

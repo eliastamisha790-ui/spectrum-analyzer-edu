@@ -40,6 +40,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--absolute-tolerance", type=float, default=0.5, help="核素匹配绝对容差（keV）")
     parser.add_argument("--relative-tolerance", type=float, default=0.002, help="核素匹配相对容差")
     parser.add_argument("--max-candidates", type=int, default=3, help="每个峰最多保留的核素候选数")
+    parser.add_argument("--width-tolerance", type=float, default=0.5, help="容差下限按 FWHM 的倍数放宽")
+    parser.add_argument("--interference-width", type=float, default=1.0, help="两条参考线相距小于 FWHM 的该倍数时判为双线")
+    parser.add_argument("--background", help="实测本底谱文件（SPE/XLSX/CSV/TXT），先扣除再分析")
+    parser.add_argument(
+        "--background-scale",
+        choices=("live", "real", "none"),
+        default="live",
+        help="本底归一方式：live=按活时间比，real=按实时间比，none=1:1 直扣",
+    )
+    parser.add_argument("--no-snip-after-background", action="store_true", help="扣除本底后不再做 SNIP 连续本底估计")
     parser.add_argument("--json", dest="json_path", help="将结果写入 JSON 文件")
     return parser
 
@@ -50,12 +60,20 @@ def analyze_file(
     offset: float,
     library_path: str | None = None,
     config: AnalysisConfig | None = None,
+    background_path: str | None = None,
 ) -> dict:
     record = load_spectrum_file(path)
+    background = load_spectrum_file(background_path) if background_path else None
     library = load_nuclide_library(library_path) if library_path else NNDC_LIBRARY
     settings = (config or AnalysisConfig()).validated()
-    result = analyze_spectrum(record, CalibrationModel([slope, offset]), library=library, config=settings)
-    return {
+    result = analyze_spectrum(
+        record,
+        CalibrationModel([slope, offset]),
+        library=library,
+        config=settings,
+        background=background,
+    )
+    payload = {
         "source": Path(path).name,
         "channels": len(record.channels),
         "real_time_s": record.real_time,
@@ -67,6 +85,7 @@ def analyze_file(
             {
                 "nuclide": item.isotope,
                 "matched_lines": item.matched_lines,
+                "ambiguous_lines": item.ambiguous_lines,
                 "total_reference_lines": item.total_lines,
                 "intensity_coverage": round(item.intensity_coverage, 4),
                 "match_score": round(item.match_score, 4),
@@ -79,15 +98,41 @@ def analyze_file(
                 "energy_kev": round(peak.energy, 4),
                 "area": round(peak.area, 4),
                 "fwhm_channel": round(peak.fwhm, 4),
+                "fwhm_kev": round(peak.fwhm_kev, 4),
                 "snr": round(peak.snr, 4),
                 "primary_isotope": peak.primary_isotope or None,
                 "candidates": peak.nuclide_candidates,
                 "match_score": round(peak.confidence, 4),
+                "unresolved_doublet": [
+                    {
+                        "nuclide": line.isotope,
+                        "energy_kev": line.energy,
+                        "intensity": line.intensity,
+                        "delta_kev": round(line.delta_kev, 4),
+                        "intensity_share": round(line.weight, 4),
+                    }
+                    for line in peak.interference
+                ]
+                if peak.is_ambiguous
+                else [],
             }
             for peak in result.peaks
         ],
         "warning": "Teaching/research prototype; results are not certified measurements.",
     }
+    if result.background is not None:
+        info = result.background
+        payload["background"] = {
+            "file": Path(info.filepath).name,
+            "scale_mode": info.scale_mode,
+            "scale": round(info.scale, 6),
+            "resampled": info.resampled,
+            "clipped_channels": info.clipped_channels,
+            "clipped_fraction": round(info.clipped_fraction, 4),
+            "continuum_after_subtraction": info.continuum,
+            "warnings": list(info.warnings),
+        }
+    return payload
 
 
 def main() -> None:
@@ -102,9 +147,20 @@ def main() -> None:
         absolute_tolerance_kev=args.absolute_tolerance,
         relative_tolerance=args.relative_tolerance,
         max_candidates=args.max_candidates,
+        width_tolerance_factor=args.width_tolerance,
+        interference_width_factor=args.interference_width,
+        background_scale=args.background_scale,
+        snip_after_background=not args.no_snip_after_background,
     )
     try:
-        payload = analyze_file(args.spectrum, args.slope, args.offset, args.library, config)
+        payload = analyze_file(
+            args.spectrum,
+            args.slope,
+            args.offset,
+            args.library,
+            config,
+            background_path=args.background,
+        )
     except ValueError as exc:
         parser.error(str(exc))
     output = json.dumps(payload, ensure_ascii=False, indent=2)

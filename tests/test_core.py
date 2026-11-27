@@ -14,8 +14,11 @@ from spectrum_analyzer.core import (
     SpectrumRecord,
     analyze_spectrum,
     fit_energy_calibration,
+    flatten_library,
     load_nuclide_library,
     load_spectrum_file,
+    match_nuclides,
+    subtract_background,
     summarize_nuclide_matches,
 )
 from spectrum_analyzer.demo import (
@@ -125,6 +128,201 @@ class AnalysisTests(unittest.TestCase):
         summary = summarize_nuclide_matches(peaks, NNDC_LIBRARY)
         self.assertEqual(summary[0].isotope, "eu-152")
         self.assertGreaterEqual(summary[0].matched_lines, 6)
+
+
+class InterferenceTests(unittest.TestCase):
+    def test_builtin_library_covers_natural_decay_chains(self) -> None:
+        for isotope in (
+            "u-235",
+            "ra-226",
+            "pb-210",
+            "th-234",
+            "pb-214",
+            "bi-214",
+            "ac-228",
+            "pb-212",
+            "bi-212",
+            "tl-208",
+            "k-40",
+        ):
+            self.assertIn(isotope, NNDC_LIBRARY, f"内置库缺少 {isotope}")
+
+    def test_u235_ra226_doublet_is_flagged_without_primary_isotope(self) -> None:
+        # 185.97 keV is the unresolved u-235 (185.715) / ra-226 (186.211) blend.
+        peaks = [PeakResult(channel=1355.94, fwhm=10.44, area=4051.0, snr=19.0)]
+        match_nuclides(
+            peaks,
+            CalibrationModel([0.137145, 0.0133]),
+            flatten_library(NNDC_LIBRARY),
+        )
+        peak = peaks[0]
+        self.assertTrue(peak.is_ambiguous)
+        self.assertEqual(peak.primary_isotope, "")
+        self.assertEqual(peak.reference_intensity, 0.0)
+        self.assertEqual({line.isotope for line in peak.interference}, {"u-235", "ra-226"})
+        self.assertAlmostEqual(sum(line.weight for line in peak.interference), 1.0, places=6)
+        self.assertIn("†", peak.as_row()[4])
+
+    def test_single_line_peak_keeps_primary_isotope(self) -> None:
+        peaks = [PeakResult(channel=4442.93, fwhm=10.79, area=23964.0, snr=71.0)]
+        match_nuclides(peaks, CalibrationModel([0.137145, 0.0133]), flatten_library(NNDC_LIBRARY))
+        peak = peaks[0]
+        self.assertAlmostEqual(peak.energy, 609.31, delta=0.05)
+        self.assertFalse(peak.is_ambiguous)
+        self.assertEqual(peak.primary_isotope, "bi-214")
+        self.assertGreater(peak.confidence, 0.5)
+        self.assertIn("bi-214", peak.as_row()[4])
+
+    def test_tolerance_follows_peak_width_on_low_energy_lines(self) -> None:
+        # 60.4 keV is 0.86 keV from am-241 59.541: outside the fixed 0.5 keV
+        # tolerance but inside half of a 2 keV FWHM.
+        peak = PeakResult(channel=60.4, fwhm=2.0, area=100.0, snr=10.0)
+        match_nuclides([peak], CalibrationModel([1.0, 0.0]), flatten_library(NNDC_LIBRARY))
+        self.assertEqual(peak.primary_isotope, "am-241")
+
+    def test_ambiguous_peaks_only_get_half_line_credit_in_summary(self) -> None:
+        peaks = [PeakResult(channel=185.97, fwhm=1.43, area=4051.0, snr=19.0)]
+        match_nuclides(peaks, CalibrationModel([1.0, 0.0]), flatten_library(NNDC_LIBRARY))
+        self.assertTrue(peaks[0].is_ambiguous)
+        summary = summarize_nuclide_matches(peaks, NNDC_LIBRARY)
+        by_isotope = {item.isotope: item for item in summary}
+        self.assertIn("ra-226", by_isotope)
+        self.assertEqual(by_isotope["ra-226"].ambiguous_lines, 1)
+        self.assertLess(by_isotope["ra-226"].intensity_coverage, 0.6)
+
+
+class BackgroundTests(unittest.TestCase):
+    def test_live_time_scaling_removes_matched_counts(self) -> None:
+        sample = SpectrumRecord(
+            filepath="sample.spe",
+            channels=np.arange(10, dtype=float),
+            counts=np.full(10, 20.0),
+            live_time=100.0,
+            real_time=110.0,
+        )
+        background = SpectrumRecord(
+            filepath="background.spe",
+            channels=np.arange(10, dtype=float),
+            counts=np.full(10, 10.0),
+            live_time=50.0,
+            real_time=60.0,
+        )
+        net, info = subtract_background(sample, background)
+        self.assertAlmostEqual(info.scale, 2.0)
+        np.testing.assert_allclose(net.counts, np.zeros(10))
+        self.assertEqual(info.clipped_channels, 0)
+        self.assertFalse(info.resampled)
+
+    def test_negative_channels_are_clipped_and_reported(self) -> None:
+        sample = SpectrumRecord(
+            filepath="sample.spe",
+            channels=np.arange(8, dtype=float),
+            counts=np.array([5, 5, 15, 5, 5, 5, 5, 5], dtype=float),
+            live_time=10.0,
+        )
+        background = SpectrumRecord(
+            filepath="background.spe",
+            channels=np.arange(8, dtype=float),
+            counts=np.full(8, 10.0),
+            live_time=10.0,
+        )
+        net, info = subtract_background(sample, background)
+        self.assertEqual(info.clipped_channels, 7)
+        self.assertAlmostEqual(info.clipped_fraction, 7 / 8)
+        self.assertTrue(np.all(net.counts >= 0))
+        self.assertAlmostEqual(float(net.counts[2]), 5.0)
+        self.assertTrue(any("截断" in warning for warning in net.warnings))
+
+    def test_different_channel_grid_is_resampled_with_warning(self) -> None:
+        sample = SpectrumRecord(
+            filepath="sample.spe",
+            channels=np.arange(10, dtype=float),
+            counts=np.full(10, 20.0),
+            live_time=10.0,
+        )
+        background = SpectrumRecord(
+            filepath="background.spe",
+            channels=np.arange(0, 20, 2, dtype=float),
+            counts=np.full(10, 10.0),
+            live_time=10.0,
+        )
+        net, info = subtract_background(sample, background)
+        self.assertTrue(info.resampled)
+        np.testing.assert_allclose(net.counts, np.full(10, 10.0))
+        self.assertTrue(any("重采样" in warning for warning in net.warnings))
+
+    def test_non_overlapping_ranges_are_rejected(self) -> None:
+        sample = SpectrumRecord(
+            filepath="sample.spe",
+            channels=np.arange(10, dtype=float),
+            counts=np.full(10, 1.0),
+        )
+        background = SpectrumRecord(
+            filepath="background.spe",
+            channels=np.arange(100, 110, dtype=float),
+            counts=np.full(10, 1.0),
+        )
+        with self.assertRaisesRegex(ValueError, "没有重叠"):
+            subtract_background(sample, background)
+
+    def test_measured_background_removes_an_environmental_line(self) -> None:
+        rng = np.random.default_rng(7)
+        channels = np.arange(4096, dtype=float)
+        continuum = 4.0 + 16.0 * np.exp(-channels / 850.0)
+
+        def build(line_amplitudes: tuple[tuple[float, float, float], ...]) -> np.ndarray:
+            expected = continuum.copy()
+            for energy, amplitude, sigma in line_amplitudes:
+                center = energy / DEMO_SLOPE_KEV_PER_CHANNEL
+                expected += amplitude * np.exp(-0.5 * ((channels - center) / sigma) ** 2)
+            return rng.poisson(expected).astype(float)
+
+        sample = SpectrumRecord(
+            filepath="sample.spe",
+            channels=channels,
+            counts=build(((1173.237, 900.0, 5.5), (1332.501, 820.0, 5.8), (1460.822, 700.0, 6.0))),
+            live_time=295.0,
+            real_time=300.0,
+        )
+        background = SpectrumRecord(
+            filepath="background.spe",
+            channels=channels,
+            counts=build(((1460.822, 700.0, 6.0),)),
+            live_time=295.0,
+            real_time=300.0,
+        )
+        calibration = CalibrationModel([DEMO_SLOPE_KEV_PER_CHANNEL, DEMO_OFFSET_KEV])
+
+        def k40_area(peaks: list[PeakResult]) -> float:
+            return sum(peak.area for peak in peaks if abs(peak.energy - 1460.822) < 10.0)
+
+        raw = analyze_spectrum(sample, calibration)
+        corrected = analyze_spectrum(sample, calibration, background=background)
+        self.assertIsNotNone(corrected.background)
+        self.assertAlmostEqual(corrected.background.scale, 1.0, places=6)
+        self.assertGreater(k40_area(raw.peaks), 2000.0)
+        self.assertLess(k40_area(corrected.peaks), k40_area(raw.peaks) * 0.3)
+        co60 = [peak.primary_isotope for peak in corrected.peaks if peak.primary_isotope == "co-60"]
+        self.assertGreaterEqual(len(co60), 2)
+
+    def test_analyze_spectrum_exposes_background_metadata(self) -> None:
+        record = synthetic_co60_record()
+        calibration = CalibrationModel([DEMO_SLOPE_KEV_PER_CHANNEL, DEMO_OFFSET_KEV])
+        background = SpectrumRecord(
+            filepath="background.spe",
+            channels=record.channels,
+            counts=np.zeros_like(record.counts),
+            live_time=record.live_time,
+        )
+        result = analyze_spectrum(record, calibration, background=background)
+        self.assertIsNotNone(result.background)
+        self.assertAlmostEqual(result.background.scale, 1.0, places=6)
+        self.assertEqual(result.background.continuum, "snip")
+        np.testing.assert_allclose(result.analysis_counts, record.counts)
+        config = AnalysisConfig(snip_after_background=False)
+        flat_result = analyze_spectrum(record, calibration, config=config, background=background)
+        self.assertEqual(flat_result.background.continuum, "none")
+        np.testing.assert_allclose(flat_result.baseline, np.zeros_like(record.counts))
 
 
 if __name__ == "__main__":

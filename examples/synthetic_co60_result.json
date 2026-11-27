@@ -23,15 +23,20 @@
     "min_snr": 1.25,
     "absolute_tolerance_kev": 0.5,
     "relative_tolerance": 0.002,
-    "max_candidates": 3
+    "max_candidates": 3,
+    "width_tolerance_factor": 0.5,
+    "interference_width_factor": 1.0,
+    "background_scale": "live",
+    "snip_after_background": true
   },
   "nuclide_summary": [
     {
       "nuclide": "co-60",
       "matched_lines": 2,
+      "ambiguous_lines": 0,
       "total_reference_lines": 2,
       "intensity_coverage": 1.0,
-      "match_score": 0.997
+      "match_score": 0.9972
     }
   ],
   "peaks": [
@@ -40,24 +45,28 @@
       "energy_kev": 1173.2477,
       "area": 12323.0,
       "fwhm_channel": 12.8837,
+      "fwhm_kev": 5.1535,
       "snr": 41.8776,
       "primary_isotope": "co-60",
       "candidates": [
         "co-60 (1173.2 keV)"
       ],
-      "match_score": 0.9951
+      "match_score": 0.9955,
+      "unresolved_doublet": []
     },
     {
       "channel": 3331.1516,
       "energy_kev": 1332.4606,
       "area": 11819.0,
       "fwhm_channel": 13.6788,
+      "fwhm_kev": 5.4715,
       "snr": 38.1441,
       "primary_isotope": "co-60",
       "candidates": [
         "co-60 (1332.5 keV)"
       ],
-      "match_score": 0.9845
+      "match_score": 0.9849,
+      "unresolved_doublet": []
     }
   ],
   "warning": "Teaching/research prototype; results are not certified measurements."

@@ -2,6 +2,7 @@
 
 from .core import (
     AnalysisConfig,
+    BackgroundInfo,
     CalibrationModel,
     EfficiencyModel,
     PeakResult,
@@ -10,10 +11,12 @@ from .core import (
     fit_energy_calibration,
     load_nuclide_library,
     load_spectrum_file,
+    subtract_background,
 )
 
 __all__ = [
     "AnalysisConfig",
+    "BackgroundInfo",
     "CalibrationModel",
     "EfficiencyModel",
     "PeakResult",
@@ -22,5 +25,6 @@ __all__ = [
     "fit_energy_calibration",
     "load_nuclide_library",
     "load_spectrum_file",
+    "subtract_background",
 ]
-__version__ = "0.3.0"
+__version__ = "0.4.0"
