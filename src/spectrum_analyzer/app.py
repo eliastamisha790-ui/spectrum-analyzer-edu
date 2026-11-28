@@ -1222,6 +1222,7 @@ class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
         self.activity_status_message = f"逐线效率法 · {mass:.2f} g"
         self._set_activity_header("比活度(Bq/kg)")
         self._update_activity_summary_table()
+        self._update_info_label()
         self._update_peak_table()
         text = "\n".join(
             f"{item['isotope']:7s} {item['activity_bq_per_kg']:8.2f} Bq/kg ±{item['relative_uncertainty'] * 100:4.1f}%"
@@ -2343,11 +2344,16 @@ class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
                 placeholder.setFlags(QtCore.Qt.ItemIsEnabled)
                 self.activity_table.setItem(0, col, placeholder)
             return
+        per_kg = False
+        header = self.activity_table.horizontalHeaderItem(1)
+        if header is not None and "kg" in header.text():
+            per_kg = True
         for summary in self.activity_summary:
             row = self.activity_table.rowCount()
             self.activity_table.insertRow(row)
             self.activity_table.setItem(row, 0, QtWidgets.QTableWidgetItem(summary.isotope))
-            self.activity_table.setItem(row, 1, QtWidgets.QTableWidgetItem(format_activity(summary.activity_bq)))
+            value = f"{summary.activity_bq:.2f} Bq/kg" if per_kg else format_activity(summary.activity_bq)
+            self.activity_table.setItem(row, 1, QtWidgets.QTableWidgetItem(value))
             self.activity_table.setItem(row, 2, QtWidgets.QTableWidgetItem(str(summary.peak_count)))
 
     def _update_cursor(self, event: object) -> None:
