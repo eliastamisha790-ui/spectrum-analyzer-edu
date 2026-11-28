@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 from .core import (
@@ -162,19 +163,22 @@ def quantify_from_standard(
     base = load_nuclide_library(library_path) if library_path else NNDC_LIBRARY
     standard = load_spectrum_file(standard_path)
     sample = load_spectrum_file(sample_path)
+    if os.path.abspath(standard_path) == os.path.abspath(sample_path):
+        raise ValueError(
+            "标准源谱与样品谱是同一个文件：这样算出的效率必然等于证书活度本身，结果没有意义。"
+        )
     certificate_result = certificate_library_from_file(
         certificate_path, base, target_date=decay_to or standard.measurement_date
     )
     library = certificate_result.library
 
-    def analyse(record):
-        probe = analyze_spectrum(record, None, library=library)
-        auto = auto_calibrate(probe.peaks, library)
-        if auto.model is None:
-            raise ValueError(f"{record.filepath} 自动刻度失败：{auto.note}")
-        return analyze_spectrum(record, auto.model, library=library), auto
-
-    standard_result, standard_auto = analyse(standard)
+    probe = analyze_spectrum(standard, None, library=library)
+    standard_auto = auto_calibrate(probe.peaks, library)
+    if standard_auto.model is None:
+        raise ValueError(f"{standard.filepath} 自动刻度失败：{standard_auto.note}")
+    # 同探测器同几何：样品复用标准源刻度，两套刻度混用会造成系统性错配
+    standard_result = analyze_spectrum(standard, standard_auto.model, library=library)
+    sample_result = analyze_spectrum(sample, standard_auto.model, library=library)
     lines = build_line_efficiencies(
         standard_result.peaks,
         certificate_result.certificate,
@@ -184,7 +188,6 @@ def quantify_from_standard(
     if not lines:
         raise ValueError("标准源谱里没有可用于定效率的检定谱线。")
 
-    sample_result, sample_auto = analyse(sample)
     curve = build_efficiency_from_certificate(
         standard_result.peaks,
         certificate_result.certificate,
@@ -226,7 +229,8 @@ def quantify_from_standard(
             "live_time_s": sample.live_time,
             "measurement_date": sample.measurement_date,
             "mass_kg": sample_mass_kg,
-            "calibration": [float(value) for value in sample_auto.model.coefficients],
+            "calibration": [float(value) for value in standard_auto.model.coefficients],
+            "calibration_source": "reused from standard",
         },
         "lines": [
             {

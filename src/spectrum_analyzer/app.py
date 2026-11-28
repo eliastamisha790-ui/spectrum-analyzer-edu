@@ -1156,6 +1156,18 @@ class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
         )
         if not standard_path:
             return
+        if self.current_spectrum and os.path.abspath(standard_path) == os.path.abspath(
+            self.current_spectrum.filepath
+        ):
+            QtWidgets.QMessageBox.warning(
+                self,
+                "标准源选错了",
+                "标准源不能是当前样品谱本身。\n\n"
+                "把同一份谱当标准源时，ε 会用样品自己的面积反算，"
+                "代回去必然等于证书活度（线间离散 0%、结果就是证书透传）。\n"
+                "请选择标准源谱（300 g 那瓶，如 300G.Spc）。",
+            )
+            return
         mass, accepted = QtWidgets.QInputDialog.getDouble(
             self,
             "样品质量",
@@ -1183,6 +1195,11 @@ class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "标准源刻度失败", standard_auto.note or "未能自动刻度。")
             return
         standard_result = analyze_spectrum(standard_record, standard_auto.model, library=self.nuclide_library)
+        # 同探测器同几何：样品直接复用标准源的刻度，不重新自动刻度。
+        # 效率模型的谱线能量是按标准源刻度定义的，混用两套刻度会系统性错配
+        # （实测会让低能峰丢失匹配、bi-214 从 6 条掉到 1 条）。
+        self.calibration = standard_auto.model
+        self.calibration_source = f"复用标准源刻度（{os.path.basename(standard_path)}）"
         lines = build_line_efficiencies(
             standard_result.peaks,
             certificate,
@@ -1192,23 +1209,12 @@ class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
         if not lines:
             QtWidgets.QMessageBox.warning(self, "无法定量", "标准源谱里没有可用的检定谱线。")
             return
-        sample_peaks = self.peaks or self.process_peaks()
+        sample_peaks = self.process_peaks()
         if not sample_peaks:
             QtWidgets.QMessageBox.warning(self, "提示", "样品谱没有可用峰。")
             return
-        if self.calibration.is_default():
-            # 样品还没刻度时先自动刻度，否则峰能量只有道址，匹配不上任何核素
-            auto_sample = auto_calibrate(sample_peaks, self.nuclide_library)
-            if auto_sample.model is None:
-                QtWidgets.QMessageBox.warning(
-                    self, "样品刻度失败", "样品谱未能自动刻度，请先手工刻度。" + (auto_sample.note or "")
-                )
-                return
-            self.calibration = auto_sample.model
-            self.calibration_source = "自动刻度（定量前）"
-        if not self.peaks:
-            self._match_peaks(sample_peaks)
-            self.peaks = sample_peaks
+        self._match_peaks(sample_peaks)
+        self.peaks = sample_peaks
         rows_result = quantify_sample(
             sample_peaks,
             lines,
@@ -2207,7 +2213,7 @@ class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
                 lines.append(
                     f"  {item['isotope']} | {item['activity_bq_per_kg']:.2f} Bq/kg "
                     f"±{item['relative_uncertainty'] * 100:.1f}% | {int(item['lines'])} 条线 "
-                    f"| 线间离散 {item['spread'] * 100:.1f}% | 母体 {item['parent']}"
+                    f"| 线间离散 {item['spread'] * 100:.2f}% | 母体 {item['parent']}"
                 )
         if self.efficiency_points:
             lines.append("")
