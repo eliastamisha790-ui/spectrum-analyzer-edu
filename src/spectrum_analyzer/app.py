@@ -53,7 +53,12 @@ from .certificate import (
     parse_certificate_text,
     read_certificate_file,
 )
-from .efficiency import build_efficiency_from_certificate
+from .efficiency import (
+    build_efficiency_from_certificate,
+    build_line_efficiencies,
+    quantify_sample,
+    summarize_activities,
+)
 
 APP_DATA_DIR = Path(os.environ.get("SPECTRUM_ANALYZER_DATA_DIR", Path.home() / ".spectrum-analyzer"))
 REPORT_DIR = str(APP_DATA_DIR / "reports")
@@ -603,6 +608,7 @@ class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
         self.efficiency_model = EfficiencyModel()
         self.efficiency_points: List[EfficiencyPoint] = []
         self.activity_summary: List[ActivitySummary] = []
+        self.quantification: List[Dict[str, float]] = []
         self.nuclide_summary: List[NuclideMatchSummary] = []
         self.activity_status_message: str = "等待效率刻度"
         self.nuclide_library = validate_nuclide_library(NNDC_LIBRARY)
@@ -857,6 +863,7 @@ class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
         calibration_menu = self.menuBar().addMenu("刻度")
         self.auto_calibration_action = calibration_menu.addAction("自动刻度（混合源）…")
         self.certificate_efficiency_action = calibration_menu.addAction("用证书自动做效率刻度…")
+        self.quantify_action = calibration_menu.addAction("用标准源定量当前样品…")
         self.manual_calibration_action = calibration_menu.addAction("自定义刻度点…")
         self.import_calibration_action = calibration_menu.addAction("载入能量刻度…")
         self.export_calibration_action = calibration_menu.addAction("保存能量刻度…")
@@ -875,6 +882,7 @@ class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
         self.manual_calibration_action.triggered.connect(self.open_manual_calibration_dialog)
         self.auto_calibration_action.triggered.connect(self.run_auto_calibration)
         self.certificate_efficiency_action.triggered.connect(self.run_certificate_efficiency)
+        self.quantify_action.triggered.connect(self.quantify_with_standard)
         self.import_calibration_action.triggered.connect(self.import_energy_calibration)
         self.export_calibration_action.triggered.connect(self.export_energy_calibration)
         self.limitations_action.triggered.connect(self.show_limitations)
@@ -1128,6 +1136,109 @@ class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
             "证书核素库",
             result.summary_text() + f"\n\n已保存：{library_path}\n（可用“配置 → 恢复内置教学库”还原）",
         )
+
+    def quantify_with_standard(self) -> None:
+        """Quantify the loaded sample using the standard source's own lines."""
+
+        certificate_path = os.path.join(LIBRARY_DIR, "certificate.json")
+        if not os.path.exists(certificate_path):
+            QtWidgets.QMessageBox.information(
+                self,
+                "缺少证书",
+                "定量需要证书里的活度。请先执行「配置 → 从证书生成核素库…」导入证书。",
+            )
+            return
+        if not self.current_spectrum:
+            QtWidgets.QMessageBox.information(self, "提示", "请先导入样品谱。")
+            return
+        standard_path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "选择标准源谱文件", BASE_DIR, SPECTRUM_FILE_FILTER
+        )
+        if not standard_path:
+            return
+        mass, accepted = QtWidgets.QInputDialog.getDouble(
+            self,
+            "样品质量",
+            "样品质量（g）：",
+            (self.current_spectrum.live_time and 300.81) or 300.0,
+            0.01,
+            100000.0,
+            2,
+        )
+        if not accepted or mass <= 0:
+            return
+        try:
+            with open(certificate_path, "r", encoding="utf-8") as handle:
+                certificate = certificate_from_dict(json.load(handle))
+            standard_record = load_spectrum_file(standard_path)
+        except (OSError, ValueError, TypeError) as exc:
+            QtWidgets.QMessageBox.warning(self, "读取失败", str(exc))
+            return
+
+        self.statusBar().showMessage("正在用标准源逐线定效率…")
+        QtWidgets.QApplication.processEvents()
+        standard_probe = analyze_spectrum(standard_record, None, library=self.nuclide_library)
+        standard_auto = auto_calibrate(standard_probe.peaks, self.nuclide_library)
+        if standard_auto.model is None:
+            QtWidgets.QMessageBox.warning(self, "标准源刻度失败", standard_auto.note or "未能自动刻度。")
+            return
+        standard_result = analyze_spectrum(standard_record, standard_auto.model, library=self.nuclide_library)
+        lines = build_line_efficiencies(
+            standard_result.peaks,
+            certificate,
+            standard_record.live_time,
+            target_date=standard_record.measurement_date,
+        )
+        if not lines:
+            QtWidgets.QMessageBox.warning(self, "无法定量", "标准源谱里没有可用的检定谱线。")
+            return
+        sample_peaks = self.peaks or self.process_peaks()
+        if not sample_peaks:
+            QtWidgets.QMessageBox.warning(self, "提示", "样品谱没有可用峰。")
+            return
+        if self.calibration.is_default():
+            # 样品还没刻度时先自动刻度，否则峰能量只有道址，匹配不上任何核素
+            auto_sample = auto_calibrate(sample_peaks, self.nuclide_library)
+            if auto_sample.model is None:
+                QtWidgets.QMessageBox.warning(
+                    self, "样品刻度失败", "样品谱未能自动刻度，请先手工刻度。" + (auto_sample.note or "")
+                )
+                return
+            self.calibration = auto_sample.model
+            self.calibration_source = "自动刻度（定量前）"
+        if not self.peaks:
+            self._match_peaks(sample_peaks)
+            self.peaks = sample_peaks
+        rows = quantify_sample(sample_peaks, lines, self.current_spectrum.live_time, mass / 1000.0)
+        summary = summarize_activities(rows)
+        if not summary:
+            QtWidgets.QMessageBox.warning(self, "无法定量", "样品谱里没有能与标准源对应的核素。")
+            return
+        self.quantification = summary
+        self.activity_summary = [
+            ActivitySummary(isotope=item["isotope"], activity_bq=item["activity_bq_per_kg"], peak_count=int(item["lines"]))
+            for item in summary
+        ]
+        self.activity_status_message = f"逐线效率法 · {mass:.2f} g"
+        self._set_activity_header("比活度(Bq/kg)")
+        self._update_activity_summary_table()
+        self._update_peak_table()
+        text = "\n".join(
+            f"{item['isotope']:7s} {item['activity_bq_per_kg']:8.2f} Bq/kg ±{item['relative_uncertainty'] * 100:4.1f}%"
+            f"（{item['lines']} 条线，离散 {item['spread'] * 100:.0f}%）"
+            for item in summary
+        )
+        QtWidgets.QMessageBox.information(
+            self,
+            "样品定量结果",
+            f"标准源：{os.path.basename(standard_path)}\n样品质量：{mass:.2f} g\n\n{text}",
+        )
+        self.statusBar().showMessage(f"已完成定量：{len(summary)} 个核素")
+
+    def _set_activity_header(self, title: str) -> None:
+        if not hasattr(self, "activity_table"):
+            return
+        self.activity_table.setHorizontalHeaderItem(1, QtWidgets.QTableWidgetItem(title))
 
     def run_certificate_efficiency(self) -> None:
         """Build the efficiency curve from the certificate activities in one pass."""
@@ -2080,6 +2191,15 @@ class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
                 lines.append(
                     f"  {item.isotope} | 匹配线 {item.matched_lines}/{item.total_lines}{ambiguous_note} | "
                     f"强度覆盖 {item.intensity_coverage * 100:.1f}% | 谱级分数 {item.match_score * 100:.1f}%"
+                )
+        if self.quantification:
+            lines.append("")
+            lines.append("样品定量（逐线效率法，同一核素用自己的检定谱线）:")
+            for item in self.quantification:
+                lines.append(
+                    f"  {item['isotope']} | {item['activity_bq_per_kg']:.2f} Bq/kg "
+                    f"±{item['relative_uncertainty'] * 100:.1f}% | {int(item['lines'])} 条线 "
+                    f"| 线间离散 {item['spread'] * 100:.1f}% | 母体 {item['parent']}"
                 )
         if self.efficiency_points:
             lines.append("")

@@ -71,6 +71,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="标准源谱文件：给出后用「同一核素自己的线」定效率并定量当前样品",
     )
     parser.add_argument("--sample-mass", type=float, help="样品质量（kg），用于把 Bq 换算成 Bq/kg")
+    parser.add_argument("--report", help="把定量结果写成可读文本报告")
     parser.add_argument("--snip-iterations", type=int, help="SNIP 本底迭代次数")
     parser.add_argument("--widths", type=parse_widths, default=(2, 4, 6, 8, 10, 12), help="小波宽度，如 2,4,6,8")
     parser.add_argument("--threshold-sigma", type=float, default=1.0, help="寻峰阈值系数")
@@ -239,6 +240,83 @@ def quantify_from_standard(
         ],
         "warning": "教学/科研原型结果，需人工复核；未做符合相加、自吸收与几何差异校正。",
     }
+
+
+def render_quantification_report(payload: dict) -> str:
+    """Human-readable report for the per-line quantification."""
+
+    standard = payload["standard"]
+    sample = payload["sample"]
+    lines = [
+        "沉积物样品核素定量报告（逐核素效率法）",
+        "=" * 60,
+        f"生成时间：{__import__('datetime').datetime.now():%Y-%m-%d %H:%M:%S}",
+        "",
+        "一、测量与刻度",
+        f"  标准源：{standard['file']}  活时间 {standard['live_time_s']:.0f} s  测量日期 {standard['measurement_date']}",
+        f"          能量刻度 {standard['calibration'][0]:.6f}·x + {standard['calibration'][1]:.6f}",
+        f"  样品  ：{sample['file']}  质量 {sample['mass_kg'] * 1000:.2f} g  活时间 {sample['live_time_s']:.0f} s",
+        f"          测量日期 {sample['measurement_date']}",
+        f"          能量刻度 {sample['calibration'][0]:.6f}·x + {sample['calibration'][1]:.6f}",
+        "",
+        "二、标准源逐线效率（由检定活度反算，同一几何）",
+        f"  {'核素':<8}{'母体':<7}{'能量 keV':>10}{'发射概率':>10}{'峰面积':>12}{'效率':>12}{'不确定度':>10}",
+    ]
+    for item in sorted(standard["line_efficiencies"], key=lambda x: x["energy_kev"]):
+        lines.append(
+            f"  {item['nuclide']:<8}{item['parent']:<7}{item['energy_kev']:>10.2f}{item['intensity']:>10.3f}"
+            f"{item['area']:>12.0f}{item['efficiency']:>12.4e}{item['relative_uncertainty'] * 100:>9.1f}%"
+        )
+    lines += [
+        "",
+        "三、样品逐线活度",
+        f"  {'核素':<8}{'母体':<7}{'能量 keV':>10}{'峰面积':>10}{'活度 Bq':>10}{'Bq/kg':>10}{'不确定度':>10}",
+    ]
+    for row in sorted(payload["lines"], key=lambda x: x["energy_kev"]):
+        lines.append(
+            f"  {row['nuclide']:<8}{row['parent']:<7}{row['energy_kev']:>10.2f}{row['area']:>10.0f}"
+            f"{row['activity_bq']:>10.2f}{row['activity_bq_per_kg']:>10.2f}{row['relative_uncertainty'] * 100:>9.1f}%"
+        )
+    lines += [
+        "",
+        "四、按核素汇总（同核素多线按方差加权）",
+        f"  {'核素':<8}{'母体':<7}{'Bq/kg':>10}{'不确定度':>10}{'线数':>6}{'线间离散':>10}",
+    ]
+    for item in payload["summary"]:
+        lines.append(
+            f"  {item['nuclide']:<8}{item['parent']:<7}{item['activity_bq_per_kg']:>10.2f}"
+            f"{item['relative_uncertainty'] * 100:>9.1f}%{item['lines']:>6}{item['line_spread'] * 100:>9.1f}%"
+        )
+    summary = {item["nuclide"]: item for item in payload["summary"]}
+    lines += ["", "五、自洽性检查"]
+    if "pb-214" in summary and "bi-214" in summary:
+        ratio = summary["bi-214"]["activity_bq_per_kg"] / summary["pb-214"]["activity_bq_per_kg"]
+        lines.append(
+            f"  226Ra 系：214Pb {summary['pb-214']['activity_bq_per_kg']:.2f} vs 214Bi "
+            f"{summary['bi-214']['activity_bq_per_kg']:.2f} Bq/kg，比值 {ratio:.3f}（平衡应为 1.00）"
+        )
+    if "th-234" in summary and "pb-214" in summary:
+        relation = "基本平衡" if summary["th-234"]["activity_bq_per_kg"] >= summary["pb-214"]["activity_bq_per_kg"] * 0.8 else "不平衡（铀相对镭亏损）"
+        lines.append(
+            f"  238U 对 226Ra：234Th {summary['th-234']['activity_bq_per_kg']:.2f} vs "
+            f"214Pb {summary['pb-214']['activity_bq_per_kg']:.2f} Bq/kg → {relation}"
+        )
+    if "pb-210" in summary and "pb-214" in summary:
+        ratio = summary["pb-210"]["activity_bq_per_kg"] / summary["pb-214"]["activity_bq_per_kg"]
+        extra = "（存在 210Pb 过剩，可用于沉积年代指示）" if ratio > 1.2 else ""
+        lines.append(
+            f"  210Pb 对 226Ra：{summary['pb-210']['activity_bq_per_kg']:.2f} vs "
+            f"{summary['pb-214']['activity_bq_per_kg']:.2f} Bq/kg，比值 {ratio:.2f}{extra}"
+        )
+    lines += [
+        "",
+        "六、限制声明",
+        "  1) 效率来自同一核素的检定谱线，未做符合相加、自吸收与几何差异校正；",
+        "  2) 标准源与样品质量接近、同探测器同几何时，系统偏差可部分抵消；",
+        "  3) 只有单条线且峰形不佳的核素不作为定量依据（见线间离散）；",
+        "  4) 本软件为教学/科研原型，结果需人工复核，不得用于监管或合规决策。",
+    ]
+    return "\n".join(lines) + "\n"
 
 
 def analyze_file(
@@ -517,6 +595,12 @@ def main() -> None:
             )
         except ValueError as exc:
             parser.error(str(exc))
+        if args.report:
+            destination = Path(args.report)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(render_quantification_report(payload), encoding="utf-8")
+            print(f"报告已写入：{destination.resolve()}")
+            print()
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return
 
