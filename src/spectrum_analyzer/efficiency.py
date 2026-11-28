@@ -17,6 +17,11 @@ import numpy as np
 from .certificate import Certificate, apply_decay_correction
 from .core import EfficiencyModel, PeakResult
 
+# 证书没写不确定度时采用的默认相对不确定度（标准物质常见 3~10%）
+DEFAULT_CERTIFICATE_UNCERTAINTY = 0.05
+# 低于该能量的效率受自吸收与探测器窗影响，不再给定量结果
+DEFAULT_MIN_QUANT_ENERGY = 100.0
+
 
 @dataclass
 class EfficiencyPointResult:
@@ -103,6 +108,7 @@ class LineEfficiency:
     activity_bq: float
     efficiency: float
     relative_uncertainty: float
+    certificate_uncertainty: float = DEFAULT_CERTIFICATE_UNCERTAINTY
 
     def as_text(self) -> str:
         return (
@@ -124,6 +130,14 @@ class SampleActivity:
     activity_bq: float
     activity_bq_per_kg: float
     relative_uncertainty: float
+    flag: str = ""
+
+
+@dataclass
+class QuantificationResult:
+    rows: List["SampleActivity"] = field(default_factory=list)
+    flagged: List[str] = field(default_factory=list)
+    note: str = ""
 
 
 def build_line_efficiencies(
@@ -143,6 +157,14 @@ def build_line_efficiencies(
         activity = entry.corrected_bq_per_kg() * (certificate.mass_kg or 0.0)
         if activity <= 0:
             continue
+        if entry.uncertainty is None:
+            certificate_uncertainty = DEFAULT_CERTIFICATE_UNCERTAINTY
+        elif 0 < entry.uncertainty < 1:
+            certificate_uncertainty = float(entry.uncertainty)
+        elif entry.activity_bq_per_kg:
+            certificate_uncertainty = abs(float(entry.uncertainty)) / entry.activity_bq_per_kg
+        else:
+            certificate_uncertainty = DEFAULT_CERTIFICATE_UNCERTAINTY
         for peak in peaks:
             if (peak.primary_isotope or "").lower() not in entry.proxies:
                 continue
@@ -164,6 +186,7 @@ def build_line_efficiencies(
                     activity_bq=float(activity),
                     efficiency=float(efficiency),
                     relative_uncertainty=float(uncertainty),
+                    certificate_uncertainty=float(certificate_uncertainty),
                 )
             )
     return results
@@ -174,29 +197,48 @@ def quantify_sample(
     line_efficiencies: List[LineEfficiency],
     live_time: Optional[float],
     mass_kg: float,
-) -> List[SampleActivity]:
-    """Apply each line's own efficiency to the unknown spectrum."""
+    min_energy: float = DEFAULT_MIN_QUANT_ENERGY,
+    efficiency_systematic: float = 0.0,
+) -> QuantificationResult:
+    """Apply each line's own efficiency to the unknown spectrum.
+
+    A_smp = 净面积_smp / (ε(E) · Iγ · t_smp)，Bq/kg = A_smp / m_smp。
+    分子只取样品自己的峰面积，不涉及标准源面积或证书活度。
+
+    不确定度合成三项：样品峰面积统计、证书相对不确定度、效率刻度的系统项
+    （曲线拟合相对残差，`efficiency_systematic`）。只算面积统计会得到
+    1~4% 的“假精度”。
+    """
 
     if not live_time or live_time <= 0 or not mass_kg or mass_kg <= 0:
-        return []
+        return QuantificationResult(rows=[], flagged=[], note="缺少活时间或样品质量。")
     by_isotope: Dict[str, List[LineEfficiency]] = {}
     for item in line_efficiencies:
         by_isotope.setdefault(item.isotope, []).append(item)
 
     results: List[SampleActivity] = []
+    flagged: List[str] = []
     for peak in peaks:
         isotope = (peak.primary_isotope or "").lower()
         if isotope not in by_isotope or peak.area <= 0 or peak.reference_intensity <= 0:
             continue
+        flag = ""
+        if peak.energy < min_energy:
+            flag = f"低于 {min_energy:.0f} keV，效率外推（自吸收与低能本底不可控）"
         candidates = by_isotope[isotope]
         reference = min(candidates, key=lambda item: abs(item.energy - peak.energy))
-        if abs(reference.energy - peak.energy) > max(1.5, 0.01 * peak.energy):
-            continue
+        offset = abs(reference.energy - peak.energy)
+        if offset > 3.0:
+            flag = (flag + "；" if flag else "") + f"与标准源同核素谱线相差 {offset:.1f} keV，属外推"
         activity = peak.area / (reference.efficiency * peak.reference_intensity * float(live_time))
         area_uncertainty = (
             peak.area_uncertainty / peak.area if peak.area_uncertainty > 0 else 1.0 / math.sqrt(peak.area)
         )
-        relative = math.hypot(area_uncertainty, reference.relative_uncertainty)
+        relative = math.sqrt(
+            area_uncertainty ** 2
+            + reference.certificate_uncertainty ** 2
+            + float(efficiency_systematic) ** 2
+        )
         results.append(
             SampleActivity(
                 isotope=isotope,
@@ -208,9 +250,12 @@ def quantify_sample(
                 activity_bq=float(activity),
                 activity_bq_per_kg=float(activity / mass_kg),
                 relative_uncertainty=float(relative),
+                flag=flag,
             )
         )
-    return results
+        if flag:
+            flagged.append(f"{peak.energy:.1f} keV（{flag}）")
+    return QuantificationResult(rows=results, flagged=flagged)
 
 
 def summarize_activities(rows: List[SampleActivity]) -> List[Dict[str, float]]:

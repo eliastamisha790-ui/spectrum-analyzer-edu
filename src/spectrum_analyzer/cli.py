@@ -185,7 +185,21 @@ def quantify_from_standard(
         raise ValueError("标准源谱里没有可用于定效率的检定谱线。")
 
     sample_result, sample_auto = analyse(sample)
-    rows = quantify_sample(sample_result.peaks, lines, sample.live_time, sample_mass_kg)
+    curve = build_efficiency_from_certificate(
+        standard_result.peaks,
+        certificate_result.certificate,
+        standard.live_time,
+        library,
+        target_date=decay_to or standard.measurement_date,
+    )
+    quantified = quantify_sample(
+        sample_result.peaks,
+        lines,
+        sample.live_time,
+        sample_mass_kg,
+        efficiency_systematic=curve.relative_rms,
+    )
+    rows = quantified.rows
     summary = summarize_activities(rows)
 
     return {
@@ -238,6 +252,7 @@ def quantify_from_standard(
             }
             for item in summary
         ],
+        "flagged": list(quantified.flagged),
         "warning": "教学/科研原型结果，需人工复核；未做符合相加、自吸收与几何差异校正。",
     }
 

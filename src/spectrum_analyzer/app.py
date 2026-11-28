@@ -1209,7 +1209,14 @@ class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
         if not self.peaks:
             self._match_peaks(sample_peaks)
             self.peaks = sample_peaks
-        rows = quantify_sample(sample_peaks, lines, self.current_spectrum.live_time, mass / 1000.0)
+        rows_result = quantify_sample(
+            sample_peaks,
+            lines,
+            self.current_spectrum.live_time,
+            mass / 1000.0,
+            efficiency_systematic=0.10,
+        )
+        rows = rows_result.rows
         summary = summarize_activities(rows)
         if not summary:
             QtWidgets.QMessageBox.warning(self, "无法定量", "样品谱里没有能与标准源对应的核素。")

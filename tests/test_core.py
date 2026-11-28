@@ -801,7 +801,7 @@ class EfficiencyTests(unittest.TestCase):
             clone.area_uncertainty = clone.area * 0.02
             sample_peaks.append(clone)
 
-        rows = quantify_sample(sample_peaks, lines, self.LIVE_TIME, sample_mass)
+        rows = quantify_sample(sample_peaks, lines, self.LIVE_TIME, sample_mass).rows
         summary = {item["isotope"]: item for item in summarize_activities(rows)}
         # 样品活度是标准的 1/10，质量 0.5 kg → Bq/kg = 100 × 标准 Bq/kg(100)
         for isotope in ("cs-137", "co-60", "k-40"):
@@ -817,6 +817,58 @@ class EfficiencyTests(unittest.TestCase):
         lines = build_line_efficiencies(standard, self._certificate(), self.LIVE_TIME)
         by_energy = {round(item.energy, 1): item.efficiency for item in lines}
         self.assertLess(by_energy[1332.5], by_energy[1173.2] * 0.6)
+
+
+    def test_low_energy_lines_are_flagged_not_silently_reported(self) -> None:
+        def truth(energy: float) -> float:
+            return 0.02 * (energy / 1000.0) ** -0.5
+
+        certificate = certificate_from_dict(
+            {
+                "reference_date": None,
+                "mass_kg": 1.0,
+                "entries": [
+                    {"label": "137Cs", "nuclide": "cs-137", "activity_bq_per_kg": 100.0, "proxies": ["cs-137"]},
+                    {"label": "210Pb", "nuclide": "pb-210", "activity_bq_per_kg": 100.0, "proxies": ["pb-210"]},
+                ],
+            }
+        )
+        standard = []
+        for isotope, energy, intensity in (("cs-137", 661.657, 0.851), ("pb-210", 46.539, 0.0425)):
+            area = truth(energy) * 100.0 * intensity * self.LIVE_TIME
+            peak = PeakResult(channel=energy, energy=energy, fwhm=2.0, area=area, snr=50.0)
+            peak.primary_isotope = isotope
+            peak.reference_intensity = intensity
+            peak.area_uncertainty = area * 0.01
+            standard.append(peak)
+        lines = build_line_efficiencies(standard, certificate, self.LIVE_TIME)
+
+        low = PeakResult(channel=46.6, energy=46.6, fwhm=2.0, area=1000.0, snr=30.0)
+        low.primary_isotope = "pb-210"
+        low.reference_intensity = 0.0425
+        low.area_uncertainty = 10.0
+        far = PeakResult(channel=700.0, energy=700.0, fwhm=2.0, area=1000.0, snr=30.0)
+        far.primary_isotope = "cs-137"
+        far.reference_intensity = 0.851
+        far.area_uncertainty = 10.0
+
+        quantified = quantify_sample([low, far], lines, self.LIVE_TIME, 0.3)
+        self.assertEqual(len(quantified.rows), 2)
+        # 两条都保留数值，但必须带外推标记，不能默默给值
+        self.assertTrue(all(row.flag for row in quantified.rows))
+        self.assertEqual(len(quantified.flagged), 2)
+        self.assertTrue(any("外推" in item for item in quantified.flagged))
+
+    def test_uncertainty_combines_certificate_and_area(self) -> None:
+        def truth(energy: float) -> float:
+            return 0.02 * (energy / 1000.0) ** -0.5
+
+        lines = build_line_efficiencies(self._peaks(truth), self._certificate(), self.LIVE_TIME)
+        quantified = quantify_sample(self._peaks(truth), lines, self.LIVE_TIME, 1.0)
+        for row in quantified.rows:
+            # 面积统计 1% + 证书默认 5% → 合成约 5.1%，不应停留在 1%
+            self.assertGreater(row.relative_uncertainty, 0.045)
+            self.assertLess(row.relative_uncertainty, 0.10)
 
 
 if __name__ == "__main__":
