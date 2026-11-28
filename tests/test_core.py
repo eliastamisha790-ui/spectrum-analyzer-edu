@@ -15,7 +15,9 @@ from spectrum_analyzer.core import (
     PeakResult,
     SpectrumRecord,
     analyze_spectrum,
+    auto_calibrate,
     decompose_interference,
+    detect_peaks_from_cwt,
     fit_energy_calibration,
     fit_peak_shape,
     flatten_library,
@@ -23,6 +25,8 @@ from spectrum_analyzer.core import (
     load_spectrum_file,
     match_nuclides,
     merge_close_peaks,
+    refine_peaks,
+    snip_baseline,
     subtract_background,
     summarize_nuclide_matches,
 )
@@ -410,6 +414,94 @@ class PeakFitTests(unittest.TestCase):
         self.assertFalse(peak.decomposition_resolved)
         self.assertIn("FWHM", peak.decomposition_note)
         self.assertEqual(len(peak.components), 2)
+
+
+class AutoCalibrationTests(unittest.TestCase):
+    LIBRARY = {name: NNDC_LIBRARY[name] for name in ("eu-152", "co-60", "cs-137")}
+    MIXED_LINES = (
+        (121.782, 3000.0),
+        (244.697, 1200.0),
+        (344.278, 4000.0),
+        (778.903, 2000.0),
+        (964.055, 2200.0),
+        (1112.116, 2000.0),
+        (1408.006, 2800.0),
+        (1173.237, 15000.0),
+        (1332.501, 14000.0),
+        (661.657, 12000.0),
+    )
+
+    def _mixed_spectrum(self, slope: float, offset: float, sigma: float = 2.5, seed: int = 1) -> SpectrumRecord:
+        rng = np.random.default_rng(seed)
+        channels = np.arange(4096, dtype=float)
+        expected = 3.0 + 40.0 * np.exp(-channels / 900.0)
+        for energy, area in self.MIXED_LINES:
+            centre = (energy - offset) / slope
+            amplitude = area / (sigma * np.sqrt(2.0 * np.pi))
+            expected += amplitude * np.exp(-0.5 * ((channels - centre) / sigma) ** 2)
+        return SpectrumRecord(
+            filepath="mixed.spe",
+            channels=channels,
+            counts=rng.poisson(np.clip(expected, 0, None)).astype(float),
+            live_time=900.0,
+            real_time=880.0,
+        )
+
+    @staticmethod
+    def _peaks_of(record: SpectrumRecord) -> list[PeakResult]:
+        net = np.clip(record.counts - snip_baseline(record.counts), 0, None)
+        candidates = detect_peaks_from_cwt(net)
+        return merge_close_peaks(refine_peaks(record.channels, net, record.counts, candidates))
+
+    def test_recovers_mixed_source_calibration(self) -> None:
+        record = self._mixed_spectrum(0.5, 20.0)
+        peaks = self._peaks_of(record)
+        self.assertGreaterEqual(len(peaks), 8)
+        result = auto_calibrate(peaks, self.LIBRARY)
+        self.assertIsNotNone(result.model)
+        slope, offset = result.model.coefficients
+        self.assertAlmostEqual(slope, 0.5, delta=0.001)
+        self.assertAlmostEqual(offset, 20.0, delta=0.3)
+        self.assertTrue(result.credible)
+        self.assertFalse(result.ambiguous)
+        identified = {name for name, _, _ in result.nuclide_ranking}
+        self.assertEqual(identified, {"eu-152", "co-60", "cs-137"})
+
+    def test_recovers_a_different_slope_range(self) -> None:
+        record = self._mixed_spectrum(0.25, 0.0, sigma=1.5, seed=7)
+        result = auto_calibrate(self._peaks_of(record), self.LIBRARY)
+        self.assertIsNotNone(result.model)
+        self.assertAlmostEqual(result.model.coefficients[0], 0.25, delta=0.001)
+        self.assertAlmostEqual(result.model.coefficients[1], 0.0, delta=0.3)
+
+    def test_requires_at_least_four_peaks(self) -> None:
+        record = self._mixed_spectrum(0.5, 20.0)
+        peaks = self._peaks_of(record)[:3]
+        result = auto_calibrate(peaks, self.LIBRARY)
+        self.assertIsNone(result.model)
+        self.assertIn("4", result.note)
+
+    def test_random_spectrum_is_not_credible(self) -> None:
+        rng = np.random.default_rng(11)
+        noise = SpectrumRecord(
+            filepath="noise.spe",
+            channels=np.arange(4096, dtype=float),
+            counts=rng.poisson(5.0, 4096).astype(float),
+            live_time=100.0,
+            real_time=99.0,
+        )
+        result = auto_calibrate(self._peaks_of(noise), NNDC_LIBRARY)
+        self.assertFalse(result.credible)
+
+    def test_doublet_peak_contributes_only_one_fit_point(self) -> None:
+        # 186 keV 处 U-235 与 Ra-226 共用同一条实测峰，若两条线都参与拟合会把刻度拉偏
+        record = synthetic_doublet_record()
+        peaks = self._peaks_of(record)
+        result = auto_calibrate(peaks, NNDC_LIBRARY)
+        self.assertIsNotNone(result.model)
+        slope, offset = result.model.coefficients
+        self.assertAlmostEqual(slope, DOUBLET_SLOPE_KEV_PER_CHANNEL, delta=0.0005)
+        self.assertAlmostEqual(offset, DOUBLET_OFFSET_KEV, delta=0.15)
 
 
 if __name__ == "__main__":

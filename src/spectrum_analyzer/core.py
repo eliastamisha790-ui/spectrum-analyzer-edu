@@ -571,6 +571,487 @@ def fit_energy_calibration(
     return CalibrationModel([float(value) for value in coefficients]), rmse
 
 
+@dataclass
+class CalibrationMatch:
+    """One reference line that landed on an observed peak."""
+
+    isotope: str
+    energy: float
+    intensity: float
+    channel: float
+    residual_kev: float
+    quality: float
+
+
+@dataclass
+class AutoCalibrationResult:
+    """Outcome of the mixed-source automatic energy calibration search."""
+
+    model: Optional[CalibrationModel]
+    score: float
+    runner_up_score: float
+    ambiguous: bool
+    matched: List[CalibrationMatch] = field(default_factory=list)
+    nuclide_ranking: List[Tuple[str, int, float]] = field(default_factory=list)
+    hypotheses: int = 0
+    note: str = ""
+    residual_rms_kev: float = 0.0
+    normalized_rms: float = 0.0
+    credible: bool = False
+
+    def summary_text(self) -> str:
+        if self.model is None:
+            return self.note or "未能找到自洽的能量刻度候选。"
+
+        spots = self.matched
+        unique_channels = len({round(item.channel, 3) for item in spots})
+        quality = (sum(item.quality for item in spots) / len(spots)) if spots else 0.0
+        ranking = "、".join(f"{isotope}({lines} 线)" for isotope, lines, _ in self.nuclide_ranking[:4])
+        return (
+            f"刻度：{self.model.describe()}\n"
+            f"命中的参考线：{len(spots)} 条 / 独立峰 {unique_channels} 个\n"
+            f"平均能量吻合度：{quality * 100:.1f}%\n"
+            f"残差 RMS：{self.residual_rms_kev:.3f} keV（归一化 {self.normalized_rms:.2f}）\n"
+            f"主要贡献核素：{ranking or '无'}\n"
+            f"评估过的候选刻度：{self.hypotheses} 个\n"
+            + (f"次优候选得分 {self.runner_up_score:.3f}（最高 {self.score:.3f}）\n" if self.runner_up_score > 0 else "")
+            + (f"可信度：{'通过' if self.credible else '未通过'}\n")
+            + (f"注意：{self.note}" if self.note else "")
+        )
+
+
+def _nearest_channel_distance(predicted: np.ndarray, channels: np.ndarray) -> np.ndarray:
+    """Distance from each predicted channel to the closest observed peak channel."""
+
+    position = np.searchsorted(channels, predicted)
+    position = np.clip(position, 0, len(channels) - 1)
+    right = channels[position]
+    left_index = np.clip(position - 1, 0, len(channels) - 1)
+    left = channels[left_index]
+    return np.minimum(np.abs(predicted - right), np.abs(predicted - left))
+
+
+def auto_calibrate(
+    peaks: List[PeakResult],
+    library: Dict[str, List[Dict[str, float]]],
+    absolute_tolerance_kev: float = 0.5,
+    relative_tolerance: float = 0.002,
+    max_peaks: int = 36,
+    min_intensity: float = 0.01,
+    pair_intensity: float = 0.05,
+    slope_bounds: Tuple[float, float] = (0.02, 5.0),
+    min_points: int = 3,
+) -> AutoCalibrationResult:
+    """Find an energy calibration for a mixed-nuclide spectrum.
+
+    The human workflow is reproduced literally: every pair of observed peaks is
+    paired with every pair of reference lines to form a calibration hypothesis,
+    then *all* remaining reference lines vote on that hypothesis. A wrong pairing
+    maps the certificate lines to empty channels and dies on the global vote,
+    while the right pairing lights up several lines of several nuclides at once.
+
+    Scoring is intensity weighted and rewards complete isotopes rather than
+    isolated hits, so a coincidence that happens to catch three lines of one
+    nuclide still loses to a calibration that explains a whole decay scheme.
+    The best handful of hypotheses are then refitted by least squares on their
+    matched points, which removes the quantisation of the two-point estimate.
+    """
+
+    reference = validate_nuclide_library(library)
+    usable = [peak for peak in peaks if peak.channel > 0 and peak.area > 0]
+    if len(usable) < 4:
+        return AutoCalibrationResult(
+            model=None,
+            score=0.0,
+            runner_up_score=0.0,
+            ambiguous=False,
+            note=f"可用峰只有 {len(usable)} 个，至少需要 4 个不同能量的峰才能自动刻度。",
+        )
+
+    # 只保留最显著的一批峰，既控复杂度也避免本底小起伏参与配对
+    ranked = sorted(usable, key=lambda item: item.area * max(item.snr, 1.0), reverse=True)[: int(max_peaks)]
+    ranked.sort(key=lambda item: item.channel)
+    channels = np.asarray([peak.channel for peak in ranked], dtype=float)
+    fwhms = np.asarray([peak.fwhm for peak in ranked], dtype=float)
+    median_fwhm = float(np.median(fwhms[fwhms > 0])) if np.any(fwhms > 0) else 4.0
+    tolerance_channels = max(1.5, 0.55 * median_fwhm)
+
+    lines: List[Dict[str, float]] = []
+    for isotope, entries in reference.items():
+        for entry in entries:
+            if float(entry["intensity"]) >= float(min_intensity):
+                lines.append(
+                    {
+                        "isotope": isotope,
+                        "energy": float(entry["energy"]),
+                        "intensity": float(entry["intensity"]),
+                    }
+                )
+    if len(lines) < 4:
+        return AutoCalibrationResult(
+            model=None,
+            score=0.0,
+            runner_up_score=0.0,
+            ambiguous=False,
+            note="当前核素库的有效参考线太少，无法自动刻度。",
+        )
+
+    line_energy = np.asarray([line["energy"] for line in lines], dtype=float)
+    line_intensity = np.asarray([line["intensity"] for line in lines], dtype=float)
+    isotopes = sorted({line["isotope"] for line in lines})
+    isotope_index = {name: index for index, name in enumerate(isotopes)}
+    line_isotope = np.asarray([isotope_index[line["isotope"]] for line in lines], dtype=int)
+
+    totals = np.zeros(len(isotopes), dtype=float)
+    for index, weight in zip(line_isotope, line_intensity):
+        totals[index] += weight
+    totals = np.maximum(totals, 1e-12)
+    one_hot = np.zeros((len(lines), len(isotopes)), dtype=float)
+    one_hot[np.arange(len(lines)), line_isotope] = 1.0
+
+    strong = np.where(line_intensity >= float(pair_intensity))[0]
+    if len(strong) < 2:
+        strong = np.argsort(-line_intensity)[: min(8, len(lines))]
+    pair_left, pair_right = [], []
+    for i_index in range(len(strong)):
+        for j_index in range(i_index + 1, len(strong)):
+            first, second = strong[i_index], strong[j_index]
+            if line_energy[first] == line_energy[second]:
+                continue
+            if line_energy[first] < line_energy[second]:
+                pair_left.append(first)
+                pair_right.append(second)
+            else:
+                pair_left.append(second)
+                pair_right.append(first)
+    if not pair_left:
+        return AutoCalibrationResult(
+            model=None, score=0.0, runner_up_score=0.0, ambiguous=False, note="核素库中没有可用于配对的不同能量线。"
+        )
+    pair_left = np.asarray(pair_left, dtype=int)
+    pair_right = np.asarray(pair_right, dtype=int)
+    delta_energy = line_energy[pair_right] - line_energy[pair_left]
+
+    scored: List[Tuple[float, float, float]] = []
+    evaluated = 0
+    channel_span = float(channels[-1])
+
+    for i_index in range(len(channels) - 1):
+        for j_index in range(i_index + 1, len(channels)):
+            delta_channel = channels[j_index] - channels[i_index]
+            if delta_channel <= 0:
+                continue
+            slopes = delta_energy / delta_channel
+            offsets = line_energy[pair_left] - slopes * channels[i_index]
+            keep = (
+                (slopes >= float(slope_bounds[0]))
+                & (slopes <= float(slope_bounds[1]))
+                & (offsets > -50.0)
+                & (offsets + slopes * channel_span < 3200.0)
+            )
+            if not np.any(keep):
+                continue
+            slopes = slopes[keep]
+            offsets = offsets[keep]
+            evaluated += int(len(slopes))
+            scores = _score_hypotheses(
+                slopes,
+                offsets,
+                channels,
+                tolerance_channels,
+                line_energy,
+                line_intensity,
+                line_isotope,
+                isotopes,
+                totals,
+                one_hot,
+                absolute_tolerance_kev,
+                relative_tolerance,
+                min_points,
+            )
+            for index in np.argsort(-scores)[:3]:
+                scored.append((float(scores[index]), float(slopes[index]), float(offsets[index])))
+
+    if not scored:
+        return AutoCalibrationResult(
+            model=None,
+            score=0.0,
+            runner_up_score=0.0,
+            ambiguous=False,
+            note="在给定的斜率范围内没有产生任何候选刻度。",
+        )
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+    best_score = scored[0][0]
+    if best_score <= 0:
+        return AutoCalibrationResult(
+            model=None,
+            score=0.0,
+            runner_up_score=0.0,
+            ambiguous=False,
+            hypotheses=evaluated,
+            note="所有候选刻度都无法让任何参考线落在实测峰上，请先确认核素库是否匹配该样品。",
+        )
+
+    # 对排名前的候选逐个精修，再排序：两点评分只是初筛，真正可比的是精修后的分数
+    refined_candidates: List[Tuple[float, float, float, List[Tuple[int, float, float]]]] = []
+    scanned = 0
+    for raw_score, slope, offset in scored:
+        if scanned >= 60 or len(refined_candidates) >= 8:
+            break
+        scanned += 1
+        if any(abs(slope - value[1]) / max(abs(value[1]), 1e-9) < 1e-3 for value in refined_candidates):
+            continue
+        refined = _refine_hypothesis(
+            slope,
+            offset,
+            channels,
+            tolerance_channels,
+            line_energy,
+            line_intensity,
+            line_isotope,
+            isotopes,
+            totals,
+            one_hot,
+            absolute_tolerance_kev,
+            relative_tolerance,
+            min_points,
+        )
+        if refined is None:
+            continue
+        (refined_slope, refined_offset), refined_score, entries = refined
+        if refined_score <= 0:
+            continue
+        # 同一组峰上的同一套参考线就是同一个解，即使最小二乘收敛到略微不同的斜率
+        if any(_assignment_overlap(entries, value[3]) for value in refined_candidates):
+            continue
+        refined_candidates.append((refined_score, refined_slope, refined_offset, entries))
+
+    if not refined_candidates:
+        return AutoCalibrationResult(
+            model=None,
+            score=best_score,
+            runner_up_score=0.0,
+            ambiguous=False,
+            hypotheses=evaluated,
+            note="最优候选无法完成最小二乘精修。",
+        )
+
+    refined_candidates.sort(key=lambda item: item[0], reverse=True)
+    score, slope, offset, entries = refined_candidates[0]
+    runner_up = float(refined_candidates[1][0]) if len(refined_candidates) > 1 else 0.0
+    model = CalibrationModel([float(slope), float(offset)])
+
+    matched = []
+    for entry in entries:
+        matched.append(
+            CalibrationMatch(
+                isotope=isotopes[int(line_isotope[entry[0]])],
+                energy=float(line_energy[entry[0]]),
+                intensity=float(line_intensity[entry[0]]),
+                channel=float(entry[1]),
+                residual_kev=float(line_energy[entry[0]] - model.energy(entry[1])),
+                quality=float(entry[2]),
+            )
+        )
+    counts: Dict[str, int] = {}
+    for item in matched:
+        counts[item.isotope] = counts.get(item.isotope, 0) + 1
+    ranking = sorted(
+        ((isotope, counts[isotope], intensity_share(isotope, matched, reference)) for isotope in counts),
+        key=lambda item: (item[1], item[2]),
+        reverse=True,
+    )
+
+    # 归一化残差：真实解残差远小于容差；偶然对齐的残差在容差内近似均匀分布
+    normalized_residuals = []
+    for item in matched:
+        local_tolerance = max(
+            float(absolute_tolerance_kev),
+            item.energy * float(relative_tolerance),
+            tolerance_channels * abs(slope),
+        )
+        normalized_residuals.append(abs(item.residual_kev) / max(local_tolerance, 1e-9))
+    normalized_rms = (
+        float(np.sqrt(np.mean(np.square(normalized_residuals)))) if normalized_residuals else 1.0
+    )
+    residual_rms_kev = (
+        float(np.sqrt(np.mean(np.square([item.residual_kev for item in matched])))) if matched else 0.0
+    )
+
+    ambiguous = runner_up > 0 and score > 0 and runner_up / score > 0.95
+    # 命中线数必须明显多于拟合参数（2 个），否则残差小只是过拟合的假象
+    credible = (not ambiguous) and len(matched) >= 5 and normalized_rms < 0.35
+    note = ""
+    if ambiguous:
+        note = (
+            f"存在近似同分的第二个解（{runner_up / score * 100:.0f}%），"
+            "无法唯一确定刻度，建议补充标准源谱线或改用两点手工刻度。"
+        )
+    elif len(matched) < 5:
+        note = "命中参考线少于 5 条，拟合参数几乎与数据点同量，刻度只能视为初筛结果。"
+    elif normalized_rms >= 0.35:
+        note = f"归一化残差 {normalized_rms:.2f} 偏大，命中可能来自偶然重合，请人工核对。"
+
+    return AutoCalibrationResult(
+        model=model,
+        score=float(score),
+        runner_up_score=float(runner_up),
+        ambiguous=ambiguous,
+        matched=matched,
+        nuclide_ranking=ranking,
+        hypotheses=evaluated,
+        note=note,
+        residual_rms_kev=residual_rms_kev,
+        normalized_rms=normalized_rms,
+        credible=bool(credible),
+    )
+
+
+def intensity_share(isotope: str, matched: List[CalibrationMatch], reference: Dict[str, List[Dict[str, float]]]) -> float:
+    lines = reference.get(isotope, [])
+    total = sum(float(line["intensity"]) for line in lines) or 1.0
+    hit = sum(item.intensity for item in matched if item.isotope == isotope)
+    return hit / total
+
+
+def _assignment_overlap(
+    first: List[Tuple[int, float, float]],
+    second: List[Tuple[int, float, float]],
+    threshold: float = 0.7,
+) -> bool:
+    """True when two hypotheses put reference lines on essentially the same peaks."""
+
+    peaks_first = {round(entry[1], 1) for entry in first}
+    peaks_second = {round(entry[1], 1) for entry in second}
+    if not peaks_first or not peaks_second:
+        return False
+    shared = len(peaks_first & peaks_second)
+    return shared / min(len(peaks_first), len(peaks_second)) >= threshold
+
+
+def _score_hypotheses(
+    slopes: np.ndarray,
+    offsets: np.ndarray,
+    channels: np.ndarray,
+    tolerance_channels: float,
+    line_energy: np.ndarray,
+    line_intensity: np.ndarray,
+    line_isotope: np.ndarray,
+    isotopes: List[str],
+    totals: np.ndarray,
+    one_hot: np.ndarray,
+    absolute_tolerance_kev: float,
+    relative_tolerance: float,
+    min_points: int,
+) -> np.ndarray:
+    """Vectorised global vote for a batch of linear calibration hypotheses."""
+
+    predicted = (line_energy[None, :] - offsets[:, None]) / slopes[:, None]
+    distance = _nearest_channel_distance(predicted, channels)
+    energy_tolerance = np.maximum(absolute_tolerance_kev, line_energy[None, :] * relative_tolerance)
+    in_channel = distance <= tolerance_channels
+    in_energy = distance * slopes[:, None] <= energy_tolerance
+    valid = in_channel & in_energy
+    closeness = np.clip(1.0 - distance / tolerance_channels, 0.0, 1.0)
+    weighted = np.where(valid, line_intensity[None, :] * closeness, 0.0)
+
+    matched_intensity = weighted @ one_hot
+    matched_counts = valid.astype(float) @ one_hot
+    coverage = matched_intensity / totals[None, :]
+    # 强度加权的平均吻合度：弱线不应该拉低强线的结论
+    quality = np.divide(
+        matched_intensity,
+        np.maximum(np.where(valid, line_intensity[None, :], 0.0) @ one_hot, 1e-12),
+    )
+
+    reward = np.where(
+        matched_counts >= 3.0,
+        1.15,
+        np.where(matched_counts >= 2.0, 1.0, np.where(matched_counts >= 1.0, 0.55, 0.0)),
+    )
+    per_isotope = coverage * reward * (0.7 + 0.3 * np.clip(quality, 0.0, 1.0))
+    scores = per_isotope.sum(axis=1)
+    scores[valid.sum(axis=1) < int(min_points)] = 0.0
+    return scores
+
+
+def _refine_hypothesis(
+    slope: float,
+    offset: float,
+    channels: np.ndarray,
+    tolerance_channels: float,
+    line_energy: np.ndarray,
+    line_intensity: np.ndarray,
+    line_isotope: np.ndarray,
+    isotopes: List[str],
+    totals: np.ndarray,
+    one_hot: np.ndarray,
+    absolute_tolerance_kev: float,
+    relative_tolerance: float,
+    min_points: int,
+) -> Optional[Tuple[Tuple[float, float], float, List[Tuple[int, float, float]]]]:
+    """Least-squares refinement of one hypothesis on its matched points."""
+
+    best: Optional[Tuple[Tuple[float, float], float, List[Tuple[int, float, float]]]] = None
+    current_slope, current_offset = slope, offset
+    for _ in range(5):
+        predicted = (line_energy - current_offset) / current_slope
+        distance = _nearest_channel_distance(predicted, channels)
+        energy_tolerance = np.maximum(absolute_tolerance_kev, line_energy * relative_tolerance)
+        valid = (distance <= tolerance_channels) & (distance * current_slope <= energy_tolerance)
+        if int(valid.sum()) < int(min_points):
+            break
+        entries = [
+            (
+                int(index),
+                float(channels[int(np.argmin(np.abs(channels - predicted[index])))]),
+                float(max(0.0, 1.0 - distance[index] / tolerance_channels)),
+            )
+            for index in np.where(valid)[0]
+        ]
+        # 同一条实测峰只能贡献一个拟合点：双线情形下两条参考线共用峰心，
+        # 若都参与拟合，等于把同一个质心当成两个独立测量，会系统拉偏刻度
+        best_per_channel: Dict[float, Tuple[int, float, float]] = {}
+        for entry in entries:
+            key = round(entry[1], 3)
+            if key not in best_per_channel or entry[2] > best_per_channel[key][2]:
+                best_per_channel[key] = entry
+        fit_points = list(best_per_channel.values())
+        x = np.asarray([entry[1] for entry in fit_points], dtype=float)
+        y = np.asarray([line_energy[entry[0]] for entry in fit_points], dtype=float)
+        weight = np.asarray([line_intensity[entry[0]] for entry in fit_points], dtype=float)
+        if len(np.unique(x)) < 2:
+            break
+        coeffs = np.polyfit(x, y, 1, w=np.sqrt(np.maximum(weight, 1e-6)))
+        new_slope, new_offset = float(coeffs[0]), float(coeffs[1])
+        if new_slope <= 0:
+            break
+        current_slope, current_offset = new_slope, new_offset
+        score = float(
+            _score_hypotheses(
+                np.asarray([current_slope]),
+                np.asarray([current_offset]),
+                channels,
+                tolerance_channels,
+                line_energy,
+                line_intensity,
+                line_isotope,
+                isotopes,
+                totals,
+                one_hot,
+                absolute_tolerance_kev,
+                relative_tolerance,
+                min_points,
+            )[0]
+        )
+        if best is None or score >= best[1]:
+            best = ((current_slope, current_offset), score, entries)
+        else:
+            break
+    return best
+
+
 class EfficiencyModel:
     """对 ln(ε) 与 ln(E) 做多项式拟合的效率刻度模型。"""
 

@@ -11,6 +11,7 @@ from .core import (
     CalibrationModel,
     NNDC_LIBRARY,
     analyze_spectrum,
+    auto_calibrate,
     load_nuclide_library,
     load_spectrum_file,
 )
@@ -31,6 +32,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("spectrum", help="SPE、XLSX、CSV 或 TXT 谱文件")
     parser.add_argument("--slope", type=float, default=1.0, help="线性能量刻度斜率，keV/channel")
     parser.add_argument("--offset", type=float, default=0.0, help="线性能量刻度截距，keV")
+    parser.add_argument(
+        "--auto-calibrate",
+        action="store_true",
+        help="枚举候选刻度并按全库命中打分，自动确定能量刻度（忽略 --slope/--offset）",
+    )
+    parser.add_argument(
+        "--allow-unverified-calibration",
+        action="store_true",
+        help="自动刻度未通过可信度检查时仍然采用（默认改为报错退出）",
+    )
     parser.add_argument("--library", help="自定义核素参考库（JSON 或 CSV）")
     parser.add_argument("--snip-iterations", type=int, help="SNIP 本底迭代次数")
     parser.add_argument("--widths", type=parse_widths, default=(2, 4, 6, 8, 10, 12), help="小波宽度，如 2,4,6,8")
@@ -61,11 +72,60 @@ def analyze_file(
     library_path: str | None = None,
     config: AnalysisConfig | None = None,
     background_path: str | None = None,
+    auto_calibrate_enabled: bool = False,
+    allow_unverified: bool = False,
 ) -> dict:
     record = load_spectrum_file(path)
     background = load_spectrum_file(background_path) if background_path else None
     library = load_nuclide_library(library_path) if library_path else NNDC_LIBRARY
     settings = (config or AnalysisConfig()).validated()
+
+    auto_payload = None
+    if auto_calibrate_enabled:
+        # 寻峰与刻度无关，先用临时刻度拿峰，再让全库投票决定刻度，最后重跑匹配
+        probe = analyze_spectrum(
+            record,
+            CalibrationModel([1.0, 0.0]),
+            library=library,
+            config=settings,
+            background=background,
+        )
+        auto_result = auto_calibrate(
+            probe.peaks,
+            library,
+            absolute_tolerance_kev=settings.absolute_tolerance_kev,
+            relative_tolerance=settings.relative_tolerance,
+        )
+        if auto_result.model is None:
+            raise ValueError(f"自动能量刻度失败：{auto_result.note}")
+        if not auto_result.credible and not allow_unverified:
+            raise ValueError(
+                "自动能量刻度未通过可信度检查："
+                f"{auto_result.note or '候选解不唯一'}"
+                "（如确认采用，请加 --allow-unverified-calibration）"
+            )
+        slope = float(auto_result.model.coefficients[0])
+        offset = float(auto_result.model.coefficients[1])
+        auto_payload = {
+            "score": round(auto_result.score, 4),
+            "runner_up_score": round(auto_result.runner_up_score, 4),
+            "ambiguous": auto_result.ambiguous,
+            "credible": auto_result.credible,
+            "normalized_rms": round(auto_result.normalized_rms, 4),
+            "residual_rms_kev": round(auto_result.residual_rms_kev, 4),
+            "hypotheses": auto_result.hypotheses,
+            "note": auto_result.note,
+            "matched_lines": [
+                {
+                    "nuclide": item.isotope,
+                    "energy_kev": item.energy,
+                    "channel": round(item.channel, 3),
+                    "residual_kev": round(item.residual_kev, 4),
+                }
+                for item in auto_result.matched
+            ],
+        }
+
     result = analyze_spectrum(
         record,
         CalibrationModel([slope, offset]),
@@ -78,7 +138,12 @@ def analyze_file(
         "channels": len(record.channels),
         "real_time_s": record.real_time,
         "live_time_s": record.live_time,
-        "calibration": {"slope_kev_per_channel": slope, "offset_kev": offset},
+        "calibration": {
+            "slope_kev_per_channel": slope,
+            "offset_kev": offset,
+            "source": "auto" if auto_payload else "manual",
+            "auto": auto_payload,
+        },
         "reference_library": Path(library_path).name if library_path else "built-in-teaching-library",
         "analysis_config": settings.as_dict(),
         "nuclide_summary": [
@@ -178,6 +243,8 @@ def main() -> None:
             args.library,
             config,
             background_path=args.background,
+            auto_calibrate_enabled=args.auto_calibrate,
+            allow_unverified=args.allow_unverified_calibration,
         )
     except ValueError as exc:
         parser.error(str(exc))

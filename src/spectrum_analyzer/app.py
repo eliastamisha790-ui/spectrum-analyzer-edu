@@ -26,6 +26,8 @@ from .core import (
     PeakResult,
     SpectrumRecord,
     SPECTRUM_FILE_FILTER,
+    analyze_spectrum,
+    auto_calibrate,
     detect_peaks_from_cwt,
     decompose_interference,
     ensure_directory,
@@ -473,7 +475,7 @@ class AxisLockedViewBox(pg.ViewBox):
 class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("能谱分析工作台 v0.5")
+        self.setWindowTitle("能谱分析工作台 v0.6")
         self.resize(1280, 760)
         self.current_spectrum: Optional[SpectrumRecord] = None
         self.background_spectrum: Optional[SpectrumRecord] = None
@@ -484,6 +486,7 @@ class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
         self.smoothed_net_counts: Optional[np.ndarray] = None
         self.peaks: List[PeakResult] = []
         self.calibration = CalibrationModel()
+        self.calibration_source = "默认（未刻度）"
         self.efficiency_model = EfficiencyModel()
         self.efficiency_points: List[EfficiencyPoint] = []
         self.activity_summary: List[ActivitySummary] = []
@@ -738,6 +741,7 @@ class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
         self.snip_after_background_action.setChecked(True)
 
         calibration_menu = self.menuBar().addMenu("刻度")
+        self.auto_calibration_action = calibration_menu.addAction("自动刻度（混合源）…")
         self.manual_calibration_action = calibration_menu.addAction("自定义刻度点…")
         self.import_calibration_action = calibration_menu.addAction("载入能量刻度…")
         self.export_calibration_action = calibration_menu.addAction("保存能量刻度…")
@@ -753,6 +757,7 @@ class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
         self.snip_after_background_action.toggled.connect(self._handle_background_snip_toggled)
         self.background_scale_group.triggered.connect(self._handle_background_scale_changed)
         self.manual_calibration_action.triggered.connect(self.open_manual_calibration_dialog)
+        self.auto_calibration_action.triggered.connect(self.run_auto_calibration)
         self.import_calibration_action.triggered.connect(self.import_energy_calibration)
         self.export_calibration_action.triggered.connect(self.export_energy_calibration)
         self.limitations_action.triggered.connect(self.show_limitations)
@@ -912,6 +917,7 @@ class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
 
         self.current_spectrum = synthetic_co60_record()
         self.calibration = CalibrationModel([DEMO_SLOPE_KEV_PER_CHANNEL, DEMO_OFFSET_KEV])
+        self.calibration_source = "合成示例刻度"
         self.efficiency_model = EfficiencyModel()
         self.efficiency_points = []
         self._reset_analysis_state()
@@ -976,12 +982,78 @@ class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "刻度失败", str(exc))
             return
         self.calibration = model
+        self.calibration_source = "自定义刻度点"
         self._rematch_current_peaks()
         self._update_info_label()
         QtWidgets.QMessageBox.information(
             self,
             "能量刻度",
             f"已采用 {len(channels)} 个自定义刻度点。\n{model.describe()}\n均方根残差: {residual:.3f} keV",
+        )
+
+    def run_auto_calibration(self) -> None:
+        """Enumerate mixed-source calibration hypotheses and keep the self-consistent one."""
+
+        if not self.current_spectrum:
+            QtWidgets.QMessageBox.information(self, "提示", "未导入谱文件。")
+            return
+        peaks = self.process_peaks()
+        if len(peaks) < 4:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "峰数不足",
+                f"只找到 {len(peaks)} 个峰。自动刻度需要对多条参考线投票，至少需要 4 个峰。",
+            )
+            return
+        self.statusBar().showMessage("正在枚举候选刻度…")
+        QtWidgets.QApplication.processEvents()
+        result = auto_calibrate(
+            peaks,
+            self.nuclide_library,
+            absolute_tolerance_kev=self.analysis_config.absolute_tolerance_kev,
+            relative_tolerance=self.analysis_config.relative_tolerance,
+        )
+        self.statusBar().showMessage("自动刻度搜索完成")
+        if result.model is None:
+            QtWidgets.QMessageBox.warning(self, "自动刻度", result.note or "未能找到自洽的刻度。")
+            return
+
+        detail_lines = [
+            f"{item.isotope:8s} {item.energy:9.3f} keV  通道 {item.channel:9.1f}  残差 {item.residual_kev:+0.3f} keV"
+            for item in result.matched
+        ]
+        box = QtWidgets.QMessageBox(self)
+        box.setWindowTitle("自动能量刻度（混合源）")
+        verdict = "通过" if result.credible else "未通过"
+        box.setIcon(
+            QtWidgets.QMessageBox.Information if result.credible else QtWidgets.QMessageBox.Warning
+        )
+        box.setText(f"可信度检查：{verdict}\n\n{result.summary_text()}")
+        box.setDetailedText("命中的参考线：\n" + "\n".join(detail_lines))
+        box.setInformativeText("是否把该刻度应用到当前谱？")
+        box.setStandardButtons(QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No)
+        box.setDefaultButton(QtWidgets.QMessageBox.Yes if result.credible else QtWidgets.QMessageBox.No)
+        box.button(QtWidgets.QMessageBox.Yes).setText("应用")
+        box.button(QtWidgets.QMessageBox.No).setText("取消")
+        details_button = None
+        for candidate in box.buttons():
+            if box.buttonRole(candidate) == QtWidgets.QMessageBox.ActionRole:
+                details_button = candidate
+                break
+        if details_button is not None:
+            details_button.setText("命中线详情")
+        if box.exec_() != QtWidgets.QMessageBox.Yes:
+            self.statusBar().showMessage("已取消自动刻度")
+            return
+
+        self.calibration = result.model
+        self.calibration_source = "自动刻度（混合源）"
+        self.peaks = peaks
+        self._rematch_current_peaks()
+        self._update_info_label()
+        self._update_plot()
+        self.statusBar().showMessage(
+            f"已应用自动刻度：{result.model.describe()}（命中 {len(result.matched)} 条参考线）"
         )
 
     def import_energy_calibration(self) -> None:
@@ -1005,6 +1077,7 @@ class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "载入失败", f"能量刻度文件无效：{exc}")
             return
         self.calibration = CalibrationModel(values)
+        self.calibration_source = f"刻度文件 {os.path.basename(filepath)}"
         self._rematch_current_peaks()
         self._update_info_label()
         self.statusBar().showMessage(f"已载入能量刻度 {os.path.basename(filepath)}")
@@ -1494,6 +1567,7 @@ class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
             return
         self._match_peaks(peaks)
         self.peaks = peaks
+        self.calibration_source = f"标准源 {isotope}"
         self._recalculate_activity_analysis()
         self._update_peak_table()
         msg = (
@@ -1721,7 +1795,7 @@ class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
             f"导出时间: {datetime.datetime.now():%Y-%m-%d %H:%M:%S}",
             f"数据文件: {self.current_spectrum.filepath}",
             f"实时间/活时间: {self.current_spectrum.real_time} / {self.current_spectrum.live_time}",
-            f"能量刻度: {self.calibration.describe()}",
+            f"能量刻度: {self.calibration.describe()}（{self.calibration_source}）",
             f"效率刻度: {self.efficiency_model.describe()}",
             f"核素库: {self.library_source} ({len(self.nuclide_library)} 种核素 / {len(self.flat_library)} 条参考线)",
             f"分析参数: {json.dumps(self.analysis_config.as_dict(), ensure_ascii=False)}",
@@ -1868,6 +1942,7 @@ class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
             )
         self.info_label.setText(
             f"当前文件: {name}\n实时间/活时间: {rt} / {lt}\n"
+            f"刻度: {self.calibration_source}｜{self.calibration.describe()}\n"
             f"本底: {background_text}\n"
             f"核素库: {self.library_source}｜平滑辅助: {smoothing_text}{warning_text}"
         )

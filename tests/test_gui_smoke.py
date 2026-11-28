@@ -99,6 +99,40 @@ class GuiSmokeTests(unittest.TestCase):
         window.close()
         app.processEvents()
 
+    def test_auto_calibration_action_applies_a_credible_fit(self) -> None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+        from PyQt5 import QtWidgets
+
+        from spectrum_analyzer.app import SpectrumAnalyzerApp
+        from spectrum_analyzer.core import CalibrationModel
+        from spectrum_analyzer.demo import DOUBLET_SLOPE_KEV_PER_CHANNEL, synthetic_doublet_record
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        window = SpectrumAnalyzerApp()
+        window.current_spectrum = synthetic_doublet_record()
+        window.calibration = CalibrationModel([1.0, 0.0])
+        window._reset_analysis_state()
+        window._update_info_label()
+
+        # 自动刻度用消息框确认，这里直接答“是”
+        original_exec = QtWidgets.QMessageBox.exec_
+        QtWidgets.QMessageBox.exec_ = lambda self: QtWidgets.QMessageBox.Yes
+        try:
+            window.run_auto_calibration()
+        finally:
+            QtWidgets.QMessageBox.exec_ = original_exec
+
+        self.assertIn("自动刻度", window.calibration_source)
+        self.assertAlmostEqual(
+            window.calibration.coefficients[0], DOUBLET_SLOPE_KEV_PER_CHANNEL, delta=0.001
+        )
+        # 正确的刻度下 186 keV 才会被认成 u-235/ra-226 双线
+        self.assertTrue(any(peak.is_ambiguous for peak in window.peaks))
+
+        window.close()
+        app.processEvents()
+
 
 if __name__ == "__main__":
     unittest.main()
