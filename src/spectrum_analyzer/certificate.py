@@ -406,3 +406,47 @@ def certificate_library_from_file(
     target_date: Optional[str] = None,
 ) -> CertificateLibrary:
     return certificate_library_from_text(read_certificate_file(path), base_library, target_date)
+
+
+def certificate_to_dict(certificate: Certificate) -> Dict[str, object]:
+    """Serialise a certificate so its activities survive an app restart."""
+
+    return {
+        "reference_date": certificate.reference_date,
+        "mass_kg": certificate.mass_kg,
+        "warnings": list(certificate.warnings),
+        "entries": [
+            {
+                "label": entry.label,
+                "nuclide": entry.nuclide,
+                "activity_bq_per_kg": entry.activity_bq_per_kg,
+                "uncertainty": entry.uncertainty,
+                "proxies": list(entry.proxies),
+                "decay_factor": entry.decay_factor,
+                "activity_corrected": entry.activity_corrected,
+            }
+            for entry in certificate.entries
+        ],
+    }
+
+
+def certificate_from_dict(payload: Dict[str, object]) -> Certificate:
+    entries = []
+    for item in payload.get("entries", []):  # type: ignore[union-attr]
+        entries.append(
+            CertificateEntry(
+                label=str(item.get("label", "")),
+                nuclide=str(item.get("nuclide", "")),
+                activity_bq_per_kg=float(item.get("activity_bq_per_kg", 0.0)),
+                uncertainty=item.get("uncertainty"),  # type: ignore[arg-type]
+                proxies=list(item.get("proxies", [])),
+                decay_factor=float(item.get("decay_factor", 1.0)),
+                activity_corrected=item.get("activity_corrected"),  # type: ignore[arg-type]
+            )
+        )
+    return Certificate(
+        entries=entries,
+        reference_date=payload.get("reference_date"),  # type: ignore[arg-type]
+        mass_kg=payload.get("mass_kg"),  # type: ignore[arg-type]
+        warnings=list(payload.get("warnings", [])),  # type: ignore[arg-type]
+    )

@@ -47,10 +47,13 @@ from .core import (
 )
 from .demo import DEMO_OFFSET_KEV, DEMO_SLOPE_KEV_PER_CHANNEL, synthetic_co60_record
 from .certificate import (
+    certificate_from_dict,
     certificate_library_from_text,
+    certificate_to_dict,
     parse_certificate_text,
     read_certificate_file,
 )
+from .efficiency import build_efficiency_from_certificate
 
 APP_DATA_DIR = Path(os.environ.get("SPECTRUM_ANALYZER_DATA_DIR", Path.home() / ".spectrum-analyzer"))
 REPORT_DIR = str(APP_DATA_DIR / "reports")
@@ -585,7 +588,7 @@ class AxisLockedViewBox(pg.ViewBox):
 class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("能谱分析工作台 v0.8")
+        self.setWindowTitle("能谱分析工作台 v0.9")
         self.resize(1280, 760)
         self.current_spectrum: Optional[SpectrumRecord] = None
         self.background_spectrum: Optional[SpectrumRecord] = None
@@ -853,6 +856,7 @@ class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
 
         calibration_menu = self.menuBar().addMenu("刻度")
         self.auto_calibration_action = calibration_menu.addAction("自动刻度（混合源）…")
+        self.certificate_efficiency_action = calibration_menu.addAction("用证书自动做效率刻度…")
         self.manual_calibration_action = calibration_menu.addAction("自定义刻度点…")
         self.import_calibration_action = calibration_menu.addAction("载入能量刻度…")
         self.export_calibration_action = calibration_menu.addAction("保存能量刻度…")
@@ -870,6 +874,7 @@ class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
         self.background_scale_group.triggered.connect(self._handle_background_scale_changed)
         self.manual_calibration_action.triggered.connect(self.open_manual_calibration_dialog)
         self.auto_calibration_action.triggered.connect(self.run_auto_calibration)
+        self.certificate_efficiency_action.triggered.connect(self.run_certificate_efficiency)
         self.import_calibration_action.triggered.connect(self.import_energy_calibration)
         self.export_calibration_action.triggered.connect(self.export_energy_calibration)
         self.limitations_action.triggered.connect(self.show_limitations)
@@ -1111,10 +1116,80 @@ class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
         self.statusBar().showMessage(
             f"已按证书收缩核素库：{len(self.nuclide_library)} 种核素 / {len(self.flat_library)} 条参考线"
         )
+        # 活度要跟着库走：把证书（含活度与日期）另存一份，效率刻度会用到
+        ensure_directory(LIBRARY_DIR)
+        try:
+            with open(os.path.join(LIBRARY_DIR, "certificate.json"), "w", encoding="utf-8") as handle:
+                json.dump(certificate_to_dict(result.certificate), handle, ensure_ascii=False, indent=2)
+        except OSError as exc:
+            QtWidgets.QMessageBox.warning(self, "保存失败", f"证书信息未能保存：{exc}")
         QtWidgets.QMessageBox.information(
             self,
             "证书核素库",
             result.summary_text() + f"\n\n已保存：{library_path}\n（可用“配置 → 恢复内置教学库”还原）",
+        )
+
+    def run_certificate_efficiency(self) -> None:
+        """Build the efficiency curve from the certificate activities in one pass."""
+
+        certificate_path = os.path.join(LIBRARY_DIR, "certificate.json")
+        if not os.path.exists(certificate_path):
+            QtWidgets.QMessageBox.information(
+                self,
+                "缺少证书",
+                "效率刻度需要证书里的活度。请先执行「配置 → 从证书生成核素库…」导入证书。",
+            )
+            return
+        if not self.current_spectrum:
+            QtWidgets.QMessageBox.information(self, "提示", "未导入谱文件。")
+            return
+        try:
+            with open(certificate_path, "r", encoding="utf-8") as handle:
+                certificate = certificate_from_dict(json.load(handle))
+        except (OSError, ValueError, TypeError) as exc:
+            QtWidgets.QMessageBox.warning(self, "读取失败", f"证书信息无法读取：{exc}")
+            return
+        peaks = self.peaks or self.process_peaks()
+        if not peaks:
+            QtWidgets.QMessageBox.warning(self, "提示", "没有可用峰。")
+            return
+        if not self.peaks:
+            self._match_peaks(peaks)
+            self.peaks = peaks
+        live_time = self.current_spectrum.live_time or self.current_spectrum.real_time
+        result = build_efficiency_from_certificate(
+            peaks,
+            certificate,
+            live_time,
+            self.nuclide_library,
+        )
+        if result.model is None:
+            QtWidgets.QMessageBox.warning(self, "效率刻度", result.note or "未能建立效率曲线。")
+            return
+        self.efficiency_model = result.model
+        measurement_time = float(live_time or 0.0)
+        self.efficiency_points = [
+            EfficiencyPoint(
+                energy=point.energy,
+                efficiency=point.efficiency,
+                peak_channel=point.channel,
+                peak_area=point.area,
+                counts_per_second=point.area / measurement_time if measurement_time > 0 else 0.0,
+                intensity=point.intensity,
+                nuclide=point.nuclide,
+            )
+            for point in result.points
+            if point.accepted
+        ]
+        self.efficiency_model.set_energy_bounds([point.energy for point in self.efficiency_points])
+        self.activity_status_message = "效率刻度完成"
+        self._save_efficiency_model()
+        self._recalculate_activity_analysis()
+        self._update_info_label()
+        self._update_peak_table()
+        QtWidgets.QMessageBox.information(self, "效率刻度", result.summary_text())
+        self.statusBar().showMessage(
+            f"效率刻度完成：{len(self.efficiency_points)} 个点，相对残差 {result.relative_rms * 100:.1f}%"
         )
 
     def open_manual_calibration_dialog(self) -> None:

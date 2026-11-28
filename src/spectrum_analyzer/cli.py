@@ -17,6 +17,7 @@ from .core import (
     validate_nuclide_library,
 )
 from .certificate import certificate_library_from_file
+from .efficiency import build_efficiency_from_certificate
 
 
 def parse_widths(value: str) -> tuple[int, ...]:
@@ -54,6 +55,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="把证书活度校正到该日期（YYYY-MM-DD）；分析谱时默认取谱的测量日期",
     )
     parser.add_argument("--write-library", help="把最终使用的核素库写成 JSON，便于复用")
+    parser.add_argument(
+        "--efficiency",
+        action="store_true",
+        help="用证书活度建立效率刻度（需要 --certificate），并把结果写进 JSON",
+    )
+    parser.add_argument("--write-efficiency", help="把效率刻度（系数与点）写成 JSON")
     parser.add_argument("--snip-iterations", type=int, help="SNIP 本底迭代次数")
     parser.add_argument("--widths", type=parse_widths, default=(2, 4, 6, 8, 10, 12), help="小波宽度，如 2,4,6,8")
     parser.add_argument("--threshold-sigma", type=float, default=1.0, help="寻峰阈值系数")
@@ -143,11 +150,14 @@ def analyze_file(
     certificate_path: str | None = None,
     write_library: str | None = None,
     decay_to: str | None = None,
+    efficiency: bool = False,
+    write_efficiency: str | None = None,
 ) -> dict:
     record = load_spectrum_file(path)
     background = load_spectrum_file(background_path) if background_path else None
     base_library = load_nuclide_library(library_path) if library_path else NNDC_LIBRARY
     certificate_payload = None
+    certificate_object = None
     library = base_library
     if certificate_path:
         target_date = decay_to or record.measurement_date
@@ -155,6 +165,7 @@ def analyze_file(
             certificate_path, base_library, target_date=target_date
         )
         library = certificate_result.library
+        certificate_object = certificate_result.certificate
         certificate_payload = {
             "file": Path(certificate_path).name,
             "reference_date": certificate_result.certificate.reference_date,
@@ -235,6 +246,47 @@ def analyze_file(
         config=settings,
         background=background,
     )
+
+    efficiency_payload = None
+    if (efficiency or write_efficiency) and certificate_object is not None:
+        live_time = record.live_time or record.real_time
+        efficiency_result = build_efficiency_from_certificate(
+            result.peaks,
+            certificate_object,
+            live_time,
+            library,
+        )
+        if efficiency_result.model is not None:
+            efficiency_payload = {
+                "coefficients": [float(value) for value in efficiency_result.model.coefficients],
+                "degree": efficiency_result.degree,
+                "relative_rms": round(efficiency_result.relative_rms, 4),
+                "accepted_points": len([p for p in efficiency_result.points if p.accepted]),
+                "total_points": len(efficiency_result.points),
+                "points": [
+                    {
+                        "nuclide": point.nuclide,
+                        "energy_kev": round(point.energy, 3),
+                        "area": round(point.area, 2),
+                        "activity_bq": round(point.activity_bq, 4),
+                        "intensity": point.intensity,
+                        "efficiency": float(f"{point.efficiency:.6e}"),
+                        "residual": round(point.residual, 4),
+                        "accepted": point.accepted,
+                    }
+                    for point in efficiency_result.points
+                ],
+                "note": efficiency_result.note,
+            }
+            if write_efficiency:
+                destination = Path(write_efficiency)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_text(
+                    json.dumps(efficiency_payload, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+        else:
+            efficiency_payload = {"error": efficiency_result.note}
     payload = {
         "source": Path(path).name,
         "channels": len(record.channels),
@@ -252,6 +304,7 @@ def analyze_file(
             else (Path(library_path).name if library_path else "built-in-teaching-library")
         ),
         "certificate": certificate_payload,
+        "efficiency": efficiency_payload,
         "library_nuclides": sorted(library),
         "analysis_config": settings.as_dict(),
         "nuclide_summary": [
@@ -370,6 +423,8 @@ def main() -> None:
             certificate_path=args.certificate,
             write_library=args.write_library,
             decay_to=args.decay_to,
+            efficiency=args.efficiency,
+            write_efficiency=args.write_efficiency,
         )
     except ValueError as exc:
         parser.error(str(exc))

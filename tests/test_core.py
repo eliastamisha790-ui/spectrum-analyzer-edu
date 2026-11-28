@@ -32,12 +32,14 @@ from spectrum_analyzer.core import (
     summarize_nuclide_matches,
 )
 from spectrum_analyzer.certificate import (
+    certificate_from_dict,
     certificate_library_from_file,
     certificate_library_from_text,
     normalize_nuclide,
     parse_certificate_text,
     read_certificate_file,
 )
+from spectrum_analyzer.efficiency import build_efficiency_from_certificate
 from spectrum_analyzer.demo import (
     DEMO_OFFSET_KEV,
     DEMO_SLOPE_KEV_PER_CHANNEL,
@@ -645,6 +647,100 @@ class CertificateTests(unittest.TestCase):
             path.write_text(content, encoding="utf-8")
             record = load_spectrum_file(str(path))
         self.assertEqual(record.measurement_date, "2022-11-11")
+
+
+class EfficiencyTests(unittest.TestCase):
+    LIVE_TIME = 1000.0
+
+    def _certificate(self, activity_per_kg: float = 100.0):
+        return certificate_from_dict(
+            {
+                "reference_date": "2000-01-01",
+                "mass_kg": 1.0,
+                "entries": [
+                    {"label": "137Cs", "nuclide": "cs-137", "activity_bq_per_kg": activity_per_kg, "proxies": ["cs-137"]},
+                    {"label": "40K", "nuclide": "k-40", "activity_bq_per_kg": activity_per_kg, "proxies": ["k-40"]},
+                    {"label": "60Co", "nuclide": "co-60", "activity_bq_per_kg": activity_per_kg, "proxies": ["co-60"]},
+                    {"label": "152Eu", "nuclide": "eu-152", "activity_bq_per_kg": activity_per_kg, "proxies": ["eu-152"]},
+                ],
+            }
+        )
+
+    def _peaks(self, efficiency_at, activity: float = 100.0, scale: dict | None = None):
+        lines = [
+            ("cs-137", 661.657, 0.851),
+            ("co-60", 1173.237, 0.999),
+            ("co-60", 1332.501, 0.999),
+            ("k-40", 1460.822, 0.1066),
+            ("eu-152", 244.697, 0.0755),
+            ("eu-152", 344.278, 0.265),
+            ("eu-152", 778.903, 0.1297),
+            ("eu-152", 964.055, 0.145),
+        ]
+        peaks = []
+        for isotope, energy, intensity in lines:
+            efficiency = efficiency_at(energy)
+            area = efficiency * activity * intensity * self.LIVE_TIME
+            factor = (scale or {}).get(energy, 1.0)
+            peak = PeakResult(channel=energy, energy=energy, fwhm=2.0, area=area * factor, snr=50.0)
+            peak.primary_isotope = isotope
+            peak.reference_intensity = intensity
+            peak.area_uncertainty = area * 0.01
+            peaks.append(peak)
+        return peaks
+
+    def test_recovers_a_known_efficiency_curve(self) -> None:
+        def truth(energy: float) -> float:
+            return 0.02 * (energy / 1000.0) ** -0.5
+
+        result = build_efficiency_from_certificate(
+            self._peaks(truth),
+            self._certificate(),
+            self.LIVE_TIME,
+            NNDC_LIBRARY,
+        )
+        self.assertIsNotNone(result.model)
+        self.assertEqual(len([point for point in result.points if point.accepted]), 8)
+        for energy in (600.0, 1000.0, 1400.0):
+            self.assertAlmostEqual(result.model.efficiency(energy), truth(energy), delta=truth(energy) * 0.03)
+        self.assertLess(result.relative_rms, 0.02)
+
+    def test_reported_residuals_match_the_returned_model(self) -> None:
+        def truth(energy: float) -> float:
+            return 0.02 * (energy / 1000.0) ** -0.5
+
+        result = build_efficiency_from_certificate(
+            self._peaks(truth, scale={778.903: 1.4}),
+            self._certificate(),
+            self.LIVE_TIME,
+            NNDC_LIBRARY,
+        )
+        self.assertIsNotNone(result.model)
+        for point in result.points:
+            predicted = result.model.efficiency(point.energy)
+            self.assertAlmostEqual(point.residual, math.log(point.efficiency / predicted), places=6)
+        self.assertTrue(any(not point.accepted for point in result.points) or result.relative_rms < 0.15)
+
+    def test_missing_live_time_is_reported(self) -> None:
+        def truth(energy: float) -> float:
+            return 0.02 * (energy / 1000.0) ** -0.5
+
+        result = build_efficiency_from_certificate(self._peaks(truth), self._certificate(), None, NNDC_LIBRARY)
+        self.assertIsNone(result.model)
+        self.assertIn("活时间", result.note)
+
+    def test_ambiguous_peaks_are_skipped(self) -> None:
+        def truth(energy: float) -> float:
+            return 0.02 * (energy / 1000.0) ** -0.5
+
+        peaks = self._peaks(truth)
+        peaks[0].interference = [
+            InterferenceLine(isotope="cs-137", energy=661.657, intensity=0.851, delta_kev=0.0, weight=1.0),
+            InterferenceLine(isotope="other", energy=661.9, intensity=0.5, delta_kev=0.2, weight=0.5),
+        ]
+        result = build_efficiency_from_certificate(peaks, self._certificate(), self.LIVE_TIME, NNDC_LIBRARY)
+        self.assertTrue(any("双线" in item for item in result.skipped))
+        self.assertEqual(len(result.points), 7)
 
 
 if __name__ == "__main__":
