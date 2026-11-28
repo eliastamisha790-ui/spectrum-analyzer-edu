@@ -39,7 +39,12 @@ from spectrum_analyzer.certificate import (
     parse_certificate_text,
     read_certificate_file,
 )
-from spectrum_analyzer.efficiency import build_efficiency_from_certificate
+from spectrum_analyzer.efficiency import (
+    build_efficiency_from_certificate,
+    build_line_efficiencies,
+    quantify_sample,
+    summarize_activities,
+)
 from spectrum_analyzer.demo import (
     DEMO_OFFSET_KEV,
     DEMO_SLOPE_KEV_PER_CHANNEL,
@@ -769,6 +774,49 @@ class EfficiencyTests(unittest.TestCase):
         result = build_efficiency_from_certificate(peaks, self._certificate(), self.LIVE_TIME, NNDC_LIBRARY)
         self.assertTrue(any("双线" in item for item in result.skipped))
         self.assertEqual(len(result.points), 7)
+
+
+    def test_per_line_efficiency_quantifies_the_same_nuclide(self) -> None:
+        """标准源样品同几何时，用同一核素自己的线定效率应能还原输入活度。"""
+
+        def truth(energy: float) -> float:
+            return 0.02 * (energy / 1000.0) ** -0.5
+
+        standard_peaks = self._peaks(truth)
+        lines = build_line_efficiencies(standard_peaks, self._certificate(), self.LIVE_TIME)
+        self.assertEqual(len(lines), len(standard_peaks))
+
+        sample_mass = 0.5
+        sample_peaks = []
+        for peak in standard_peaks:
+            clone = PeakResult(
+                channel=peak.channel,
+                energy=peak.energy,
+                fwhm=2.0,
+                area=peak.area * 0.1,
+                snr=20.0,
+            )
+            clone.primary_isotope = peak.primary_isotope
+            clone.reference_intensity = peak.reference_intensity
+            clone.area_uncertainty = clone.area * 0.02
+            sample_peaks.append(clone)
+
+        rows = quantify_sample(sample_peaks, lines, self.LIVE_TIME, sample_mass)
+        summary = {item["isotope"]: item for item in summarize_activities(rows)}
+        # 样品活度是标准的 1/10，质量 0.5 kg → Bq/kg = 100 × 标准 Bq/kg(100)
+        for isotope in ("cs-137", "co-60", "k-40"):
+            self.assertAlmostEqual(summary[isotope]["activity_bq_per_kg"], 20.0, delta=0.5)
+
+    def test_per_line_efficiency_keeps_cascade_lines_apart(self) -> None:
+        """级联线被符合相加压低时，逐线法不会把偏差摊到别的核素头上。"""
+
+        def truth(energy: float) -> float:
+            return 0.02 * (energy / 1000.0) ** -0.5
+
+        standard = self._peaks(truth, scale={1332.501: 0.5})
+        lines = build_line_efficiencies(standard, self._certificate(), self.LIVE_TIME)
+        by_energy = {round(item.energy, 1): item.efficiency for item in lines}
+        self.assertLess(by_energy[1332.5], by_energy[1173.2] * 0.6)
 
 
 if __name__ == "__main__":

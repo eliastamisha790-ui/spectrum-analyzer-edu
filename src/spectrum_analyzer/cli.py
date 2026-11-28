@@ -17,7 +17,12 @@ from .core import (
     validate_nuclide_library,
 )
 from .certificate import certificate_library_from_file
-from .efficiency import build_efficiency_from_certificate
+from .efficiency import (
+    build_efficiency_from_certificate,
+    build_line_efficiencies,
+    quantify_sample,
+    summarize_activities,
+)
 
 
 def parse_widths(value: str) -> tuple[int, ...]:
@@ -61,6 +66,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="用证书活度建立效率刻度（需要 --certificate），并把结果写进 JSON",
     )
     parser.add_argument("--write-efficiency", help="把效率刻度（系数与点）写成 JSON")
+    parser.add_argument(
+        "--standard",
+        help="标准源谱文件：给出后用「同一核素自己的线」定效率并定量当前样品",
+    )
+    parser.add_argument("--sample-mass", type=float, help="样品质量（kg），用于把 Bq 换算成 Bq/kg")
     parser.add_argument("--snip-iterations", type=int, help="SNIP 本底迭代次数")
     parser.add_argument("--widths", type=parse_widths, default=(2, 4, 6, 8, 10, 12), help="小波宽度，如 2,4,6,8")
     parser.add_argument("--threshold-sigma", type=float, default=1.0, help="寻峰阈值系数")
@@ -136,6 +146,99 @@ def convert_certificate(
         )
         payload["written_to"] = str(destination.resolve())
     return payload
+
+
+def quantify_from_standard(
+    standard_path: str,
+    sample_path: str,
+    certificate_path: str,
+    sample_mass_kg: float,
+    library_path: str | None = None,
+    decay_to: str | None = None,
+) -> dict:
+    """Per-line efficiency from the standard, applied to the unknown sample."""
+
+    base = load_nuclide_library(library_path) if library_path else NNDC_LIBRARY
+    standard = load_spectrum_file(standard_path)
+    sample = load_spectrum_file(sample_path)
+    certificate_result = certificate_library_from_file(
+        certificate_path, base, target_date=decay_to or standard.measurement_date
+    )
+    library = certificate_result.library
+
+    def analyse(record):
+        probe = analyze_spectrum(record, None, library=library)
+        auto = auto_calibrate(probe.peaks, library)
+        if auto.model is None:
+            raise ValueError(f"{record.filepath} 自动刻度失败：{auto.note}")
+        return analyze_spectrum(record, auto.model, library=library), auto
+
+    standard_result, standard_auto = analyse(standard)
+    lines = build_line_efficiencies(
+        standard_result.peaks,
+        certificate_result.certificate,
+        standard.live_time,
+        target_date=decay_to or standard.measurement_date,
+    )
+    if not lines:
+        raise ValueError("标准源谱里没有可用于定效率的检定谱线。")
+
+    sample_result, sample_auto = analyse(sample)
+    rows = quantify_sample(sample_result.peaks, lines, sample.live_time, sample_mass_kg)
+    summary = summarize_activities(rows)
+
+    return {
+        "standard": {
+            "file": Path(standard_path).name,
+            "live_time_s": standard.live_time,
+            "measurement_date": standard.measurement_date,
+            "calibration": [float(value) for value in standard_auto.model.coefficients],
+            "line_efficiencies": [
+                {
+                    "nuclide": item.isotope,
+                    "parent": item.parent,
+                    "energy_kev": round(item.energy, 3),
+                    "intensity": item.intensity,
+                    "area": round(item.area, 1),
+                    "efficiency": float(f"{item.efficiency:.6e}"),
+                    "relative_uncertainty": round(item.relative_uncertainty, 4),
+                }
+                for item in lines
+            ],
+        },
+        "sample": {
+            "file": Path(sample_path).name,
+            "live_time_s": sample.live_time,
+            "measurement_date": sample.measurement_date,
+            "mass_kg": sample_mass_kg,
+            "calibration": [float(value) for value in sample_auto.model.coefficients],
+        },
+        "lines": [
+            {
+                "nuclide": row.isotope,
+                "parent": row.parent,
+                "energy_kev": round(row.energy, 3),
+                "area": round(row.area, 1),
+                "efficiency": float(f"{row.efficiency:.6e}"),
+                "activity_bq": round(row.activity_bq, 2),
+                "activity_bq_per_kg": round(row.activity_bq_per_kg, 2),
+                "relative_uncertainty": round(row.relative_uncertainty, 4),
+            }
+            for row in rows
+        ],
+        "summary": [
+            {
+                "nuclide": item["isotope"],
+                "parent": item["parent"],
+                "activity_bq_per_kg": round(item["activity_bq_per_kg"], 2),
+                "relative_uncertainty": round(item["relative_uncertainty"], 4),
+                "lines": int(item["lines"]),
+                "line_spread": round(item["spread"], 4),
+            }
+            for item in summary
+        ],
+        "warning": "教学/科研原型结果，需人工复核；未做符合相加、自吸收与几何差异校正。",
+    }
 
 
 def analyze_file(
@@ -391,6 +494,26 @@ def main() -> None:
         try:
             payload = convert_certificate(
                 args.certificate, args.library, args.write_library, args.decay_to
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
+
+    # 用标准源逐线定效率再定量样品（方向 A）
+    if args.standard:
+        if not args.certificate:
+            parser.error("用 --standard 定量时需要同时给出 --certificate")
+        if not args.sample_mass or args.sample_mass <= 0:
+            parser.error("用 --standard 定量时需要 --sample-mass（kg）")
+        try:
+            payload = quantify_from_standard(
+                args.standard,
+                args.spectrum,
+                args.certificate,
+                args.sample_mass,
+                args.library,
+                args.decay_to,
             )
         except ValueError as exc:
             parser.error(str(exc))

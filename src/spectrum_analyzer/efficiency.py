@@ -86,6 +86,158 @@ def _proxy_activity_map(certificate: Certificate) -> Dict[str, float]:
     return mapping
 
 
+@dataclass
+class LineEfficiency:
+    """Efficiency of one line, taken from the standard source itself.
+
+    Using the same nuclide's own line avoids the coincidence-summing bias that
+    makes a single smooth eps(E) curve inconsistent between cascade nuclides and
+    single-gamma nuclides.
+    """
+
+    isotope: str
+    parent: str
+    energy: float
+    intensity: float
+    area: float
+    activity_bq: float
+    efficiency: float
+    relative_uncertainty: float
+
+    def as_text(self) -> str:
+        return (
+            f"{self.isotope:7s} {self.energy:8.2f} keV  ε={self.efficiency:.4e}"
+            f" ±{self.relative_uncertainty * 100:.1f}%  ← {self.parent}"
+        )
+
+
+@dataclass
+class SampleActivity:
+    """Activity of one line in the unknown sample."""
+
+    isotope: str
+    parent: str
+    energy: float
+    intensity: float
+    area: float
+    efficiency: float
+    activity_bq: float
+    activity_bq_per_kg: float
+    relative_uncertainty: float
+
+
+def build_line_efficiencies(
+    peaks: List[PeakResult],
+    certificate: Certificate,
+    live_time: Optional[float],
+    target_date: Optional[str] = None,
+) -> List[LineEfficiency]:
+    """One efficiency per certificate line, from the standard spectrum itself."""
+
+    if not live_time or live_time <= 0:
+        return []
+    if target_date:
+        apply_decay_correction(certificate, target_date)
+    results: List[LineEfficiency] = []
+    for entry in certificate.entries:
+        activity = entry.corrected_bq_per_kg() * (certificate.mass_kg or 0.0)
+        if activity <= 0:
+            continue
+        for peak in peaks:
+            if (peak.primary_isotope or "").lower() not in entry.proxies:
+                continue
+            if peak.is_ambiguous or peak.area <= 0 or peak.reference_intensity <= 0:
+                continue
+            efficiency = peak.area / (activity * peak.reference_intensity * float(live_time))
+            if not math.isfinite(efficiency) or efficiency <= 0:
+                continue
+            uncertainty = (
+                peak.area_uncertainty / peak.area if peak.area_uncertainty > 0 else 1.0 / math.sqrt(peak.area)
+            )
+            results.append(
+                LineEfficiency(
+                    isotope=(peak.primary_isotope or "").lower(),
+                    parent=entry.label,
+                    energy=float(peak.energy),
+                    intensity=float(peak.reference_intensity),
+                    area=float(peak.area),
+                    activity_bq=float(activity),
+                    efficiency=float(efficiency),
+                    relative_uncertainty=float(uncertainty),
+                )
+            )
+    return results
+
+
+def quantify_sample(
+    peaks: List[PeakResult],
+    line_efficiencies: List[LineEfficiency],
+    live_time: Optional[float],
+    mass_kg: float,
+) -> List[SampleActivity]:
+    """Apply each line's own efficiency to the unknown spectrum."""
+
+    if not live_time or live_time <= 0 or not mass_kg or mass_kg <= 0:
+        return []
+    by_isotope: Dict[str, List[LineEfficiency]] = {}
+    for item in line_efficiencies:
+        by_isotope.setdefault(item.isotope, []).append(item)
+
+    results: List[SampleActivity] = []
+    for peak in peaks:
+        isotope = (peak.primary_isotope or "").lower()
+        if isotope not in by_isotope or peak.area <= 0 or peak.reference_intensity <= 0:
+            continue
+        candidates = by_isotope[isotope]
+        reference = min(candidates, key=lambda item: abs(item.energy - peak.energy))
+        if abs(reference.energy - peak.energy) > max(1.5, 0.01 * peak.energy):
+            continue
+        activity = peak.area / (reference.efficiency * peak.reference_intensity * float(live_time))
+        area_uncertainty = (
+            peak.area_uncertainty / peak.area if peak.area_uncertainty > 0 else 1.0 / math.sqrt(peak.area)
+        )
+        relative = math.hypot(area_uncertainty, reference.relative_uncertainty)
+        results.append(
+            SampleActivity(
+                isotope=isotope,
+                parent=reference.parent,
+                energy=float(peak.energy),
+                intensity=float(peak.reference_intensity),
+                area=float(peak.area),
+                efficiency=reference.efficiency,
+                activity_bq=float(activity),
+                activity_bq_per_kg=float(activity / mass_kg),
+                relative_uncertainty=float(relative),
+            )
+        )
+    return results
+
+
+def summarize_activities(rows: List[SampleActivity]) -> List[Dict[str, float]]:
+    """Average the per-line activities of each isotope, weighting by variance."""
+
+    grouped: Dict[str, List[SampleActivity]] = {}
+    for row in rows:
+        grouped.setdefault(row.isotope, []).append(row)
+    summary = []
+    for isotope, items in grouped.items():
+        weights = [1.0 / max(item.relative_uncertainty, 1e-6) ** 2 for item in items]
+        total_weight = sum(weights)
+        mean = sum(item.activity_bq_per_kg * weight for item, weight in zip(items, weights)) / total_weight
+        spread = max(abs(item.activity_bq_per_kg - mean) / mean for item in items) if mean > 0 else 0.0
+        summary.append(
+            {
+                "isotope": isotope,
+                "parent": items[0].parent,
+                "activity_bq_per_kg": mean,
+                "relative_uncertainty": 1.0 / math.sqrt(total_weight),
+                "lines": float(len(items)),
+                "spread": spread,
+            }
+        )
+    return sorted(summary, key=lambda item: item["activity_bq_per_kg"], reverse=True)
+
+
 def build_efficiency_from_certificate(
     peaks: List[PeakResult],
     certificate: Certificate,
