@@ -258,11 +258,17 @@ def quantify_sample(
     return QuantificationResult(rows=results, flagged=flagged)
 
 
-def summarize_activities(rows: List[SampleActivity]) -> List[Dict[str, float]]:
-    """Average the per-line activities of each isotope, weighting by variance."""
+def summarize_activities(rows: List[SampleActivity], include_flagged: bool = False) -> List[Dict[str, float]]:
+    """Average the per-line activities of each isotope, weighting by variance.
+
+    带外推标记的线默认不进入汇总：它们仍在报告里单独列出，但不该被当成“结果”
+    参与平均（否则 90.7 keV 这种外推点会把 234Th 从 14.6 拉到 61）。
+    """
 
     grouped: Dict[str, List[SampleActivity]] = {}
     for row in rows:
+        if row.flag and not include_flagged:
+            continue
         grouped.setdefault(row.isotope, []).append(row)
     summary = []
     for isotope, items in grouped.items():

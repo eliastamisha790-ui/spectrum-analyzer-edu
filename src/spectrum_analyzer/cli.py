@@ -242,6 +242,7 @@ def quantify_from_standard(
                 "activity_bq": round(row.activity_bq, 2),
                 "activity_bq_per_kg": round(row.activity_bq_per_kg, 2),
                 "relative_uncertainty": round(row.relative_uncertainty, 4),
+                "flag": row.flag,
             }
             for row in rows
         ],
@@ -304,9 +305,10 @@ def render_quantification_report(payload: dict) -> str:
     for item in payload["summary"]:
         lines.append(
             f"  {item['nuclide']:<8}{item['parent']:<7}{item['activity_bq_per_kg']:>10.2f}"
-            f"{item['relative_uncertainty'] * 100:>9.1f}%{item['lines']:>6}{item['line_spread'] * 100:>9.1f}%"
+            f"{item['relative_uncertainty'] * 100:>9.1f}%{item['lines']:>6}{item['line_spread'] * 100:>9.2f}%"
         )
     summary = {item["nuclide"]: item for item in payload["summary"]}
+    flagged = {row["nuclide"]: row for row in payload["lines"] if row.get("flag")}
     lines += ["", "五、自洽性检查"]
     if "pb-214" in summary and "bi-214" in summary:
         ratio = summary["bi-214"]["activity_bq_per_kg"] / summary["pb-214"]["activity_bq_per_kg"]
@@ -326,6 +328,18 @@ def render_quantification_report(payload: dict) -> str:
         lines.append(
             f"  210Pb 对 226Ra：{summary['pb-210']['activity_bq_per_kg']:.2f} vs "
             f"{summary['pb-214']['activity_bq_per_kg']:.2f} Bq/kg，比值 {ratio:.2f}{extra}"
+        )
+    elif "pb-210" in flagged and "pb-214" in summary:
+        ratio = flagged["pb-210"]["activity_bq_per_kg"] / summary["pb-214"]["activity_bq_per_kg"]
+        lines.append(
+            f"  210Pb（46.6 keV，外推）{flagged['pb-210']['activity_bq_per_kg']:.2f} vs "
+            f"226Ra {summary['pb-214']['activity_bq_per_kg']:.2f} Bq/kg，比值 {ratio:.2f}"
+            "（存在 210Pb 过剩，可用于沉积年代指示；该值属低能外推，未计入汇总）"
+        )
+    if "th-234" in flagged and "pb-214" in summary:
+        lines.append(
+            f"  234Th（{flagged['th-234']['energy_kev']:.1f} keV，外推）"
+            f"{flagged['th-234']['activity_bq_per_kg']:.2f} Bq/kg，未计入汇总"
         )
     lines += [
         "",
