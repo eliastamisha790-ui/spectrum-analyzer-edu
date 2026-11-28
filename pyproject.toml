@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "spectrum-analyzer-edu"
-version = "0.7.0"
+version = "0.8.0"
 description = "Educational desktop toolkit for gamma-spectrum visualization, peak detection, calibration, and nuclide matching"
 readme = "README.md"
 requires-python = ">=3.10"

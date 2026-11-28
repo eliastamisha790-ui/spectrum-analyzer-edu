@@ -299,6 +299,7 @@ class SpectrumRecord:
     real_time: Optional[float] = None
     live_time: Optional[float] = None
     warnings: List[str] = field(default_factory=list)
+    measurement_date: Optional[str] = None
 
 
 @dataclass
@@ -1140,7 +1141,30 @@ def _validated_record(record: SpectrumRecord) -> SpectrumRecord:
         real_time=record.real_time,
         live_time=record.live_time,
         warnings=list(record.warnings),
+        measurement_date=record.measurement_date,
     )
+
+
+def _iso_date_from_text(text: str) -> Optional[str]:
+    """Parse a measurement date such as ``11/11/2022 22:10:26`` into ISO form.
+
+    GammaVision writes US-style ``MM/DD/YYYY``; Chinese instruments usually write
+    ``YYYY-MM-DD`` or ``YYYY年M月D日``. Both orders are accepted here.
+    """
+
+    if not text:
+        return None
+    match = re.search(r"(\d{4})\s*[-/年.]\s*(\d{1,2})\s*[-/月.]\s*(\d{1,2})", text)
+    if match:
+        year, month, day = (int(part) for part in match.groups())
+    else:
+        match = re.search(r"(\d{1,2})/(\d{1,2})/(\d{4})", text)
+        if not match:
+            return None
+        month, day, year = (int(part) for part in match.groups())
+    if not (1 <= month <= 12 and 1 <= day <= 31):
+        return None
+    return f"{year:04d}-{month:02d}-{day:02d}"
 
 
 def parse_spe_file(filepath: str) -> SpectrumRecord:
@@ -1151,6 +1175,7 @@ def parse_spe_file(filepath: str) -> SpectrumRecord:
     reading_data = False
     pending_tag: Optional[str] = None
     real_time = live_time = None
+    measurement_date: Optional[str] = None
 
     with open(filepath, "r", encoding="utf-8-sig", errors="ignore") as handle:
         for raw_line in handle:
@@ -1193,6 +1218,11 @@ def parse_spe_file(filepath: str) -> SpectrumRecord:
                 pending_tag = None
                 continue
 
+            if pending_tag == "$DATE_MEA" and not line.startswith("$"):
+                measurement_date = _iso_date_from_text(line) or measurement_date
+                pending_tag = None
+                continue
+
             if line.startswith("$"):
                 reading_data = False
                 tag, _, payload = line.partition(":")
@@ -1223,6 +1253,9 @@ def parse_spe_file(filepath: str) -> SpectrumRecord:
                         pending_tag = None
                     else:
                         pending_tag = "$MEAS_TIM"
+                elif upper_tag.startswith("$DATE_MEA"):
+                    measurement_date = _iso_date_from_text(payload) or measurement_date
+                    pending_tag = None if measurement_date else "$DATE_MEA"
                 else:
                     pending_tag = None
                 continue
@@ -1249,6 +1282,7 @@ def parse_spe_file(filepath: str) -> SpectrumRecord:
         real_time=real_time,
         live_time=live_time,
         warnings=warnings,
+        measurement_date=measurement_date,
     ))
 
 

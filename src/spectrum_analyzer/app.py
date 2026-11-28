@@ -46,7 +46,11 @@ from .core import (
     validate_nuclide_library,
 )
 from .demo import DEMO_OFFSET_KEV, DEMO_SLOPE_KEV_PER_CHANNEL, synthetic_co60_record
-from .certificate import certificate_library_from_text
+from .certificate import (
+    certificate_library_from_text,
+    parse_certificate_text,
+    read_certificate_file,
+)
 
 APP_DATA_DIR = Path(os.environ.get("SPECTRUM_ANALYZER_DATA_DIR", Path.home() / ".spectrum-analyzer"))
 REPORT_DIR = str(APP_DATA_DIR / "reports")
@@ -67,20 +71,40 @@ CERTIFICATE_TEMPLATE = """标准源：GBW08304a（300g）
 
 
 class CertificateLibraryDialog(QtWidgets.QDialog):
-    def __init__(self, parent: QtWidgets.QWidget, base_library: Dict[str, List[Dict[str, float]]]) -> None:
+    def __init__(
+        self,
+        parent: QtWidgets.QWidget,
+        base_library: Dict[str, List[Dict[str, float]]],
+        measurement_date: Optional[str] = None,
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle("从证书生成核素库")
         self.setModal(True)
-        self.resize(760, 560)
+        self.resize(760, 620)
         self.base_library = base_library
         self.result = None
         layout = QtWidgets.QVBoxLayout(self)
         tip = QtWidgets.QLabel(
-            "把证书上的核素与比活度粘贴到下面（一行一个，兼容“238U：158 Bq/kg”“Cs-137 81”等写法）。\n"
+            "可以直接选证书文件（Word / Excel / PDF / 文本），也可以把核素与比活度粘贴到下面。\n"
             "软件只保留证书能解释的谱线，并按子体展开：238U→234Th/235U，232Th→228Ac/212Pb/208Tl，226Ra→186 keV/214Pb/214Bi。"
         )
         tip.setWordWrap(True)
         layout.addWidget(tip)
+
+        file_row = QtWidgets.QHBoxLayout()
+        self.file_btn = QtWidgets.QPushButton("选择证书文件…")
+        self.file_btn.clicked.connect(self._choose_file)
+        file_row.addWidget(self.file_btn)
+        file_row.addSpacing(12)
+        file_row.addWidget(QtWidgets.QLabel("测量日期（校正目标）"))
+        self.date_edit = QtWidgets.QLineEdit(measurement_date or "")
+        self.date_edit.setPlaceholderText("YYYY-MM-DD，留空则不校正")
+        self.date_edit.setFixedWidth(140)
+        self.date_edit.textChanged.connect(self._refresh_preview)
+        file_row.addWidget(self.date_edit)
+        file_row.addStretch(1)
+        layout.addLayout(file_row)
+
         self.editor = QtWidgets.QPlainTextEdit(CERTIFICATE_TEMPLATE)
         self.editor.setFont(QtGui.QFont("Consolas", 10))
         layout.addWidget(self.editor, 1)
@@ -99,9 +123,32 @@ class CertificateLibraryDialog(QtWidgets.QDialog):
         self.editor.textChanged.connect(self._refresh_preview)
         self._refresh_preview()
 
-    def _refresh_preview(self) -> None:
+    def _choose_file(self) -> None:
+        filepath, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "选择标准源证书",
+            BASE_DIR,
+            "证书文件 (*.docx *.xlsx *.pdf *.txt *.csv);;所有文件 (*.*)",
+        )
+        if not filepath:
+            return
         try:
-            self.result = certificate_library_from_text(self.editor.toPlainText(), self.base_library)
+            text = read_certificate_file(filepath)
+            parsed = parse_certificate_text(text)
+        except ValueError as exc:
+            QtWidgets.QMessageBox.warning(self, "无法识别", str(exc))
+            return
+        self.editor.setPlainText(text)
+        if not self.date_edit.text().strip() and parsed.reference_date:
+            self.date_edit.setText(parsed.reference_date)
+        self.statusTip()
+
+    def _refresh_preview(self) -> None:
+        target = self.date_edit.text().strip() or None
+        try:
+            self.result = certificate_library_from_text(
+                self.editor.toPlainText(), self.base_library, target_date=target
+            )
         except ValueError as exc:
             self.result = None
             self.preview.setText(f"⚠ {exc}")
@@ -538,7 +585,7 @@ class AxisLockedViewBox(pg.ViewBox):
 class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("能谱分析工作台 v0.7")
+        self.setWindowTitle("能谱分析工作台 v0.8")
         self.resize(1280, 760)
         self.current_spectrum: Optional[SpectrumRecord] = None
         self.background_spectrum: Optional[SpectrumRecord] = None
@@ -1039,7 +1086,11 @@ class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
     def import_certificate_library(self) -> None:
         """Narrow the library down to what the standard source certificate covers."""
 
-        dialog = CertificateLibraryDialog(self, self.nuclide_library)
+        dialog = CertificateLibraryDialog(
+            self,
+            self.nuclide_library,
+            measurement_date=self.current_spectrum.measurement_date if self.current_spectrum else None,
+        )
         if dialog.exec_() != QtWidgets.QDialog.Accepted or dialog.result is None:
             return
         result = dialog.result

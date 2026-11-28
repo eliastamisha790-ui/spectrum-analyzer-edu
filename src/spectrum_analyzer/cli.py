@@ -16,7 +16,7 @@ from .core import (
     load_spectrum_file,
     validate_nuclide_library,
 )
-from .certificate import certificate_library_from_text
+from .certificate import certificate_library_from_file
 
 
 def parse_widths(value: str) -> tuple[int, ...]:
@@ -47,7 +47,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--library", help="自定义核素参考库（JSON 或 CSV）")
     parser.add_argument(
         "--certificate",
-        help="标准样品源证书（纯文本），自动收缩为证书涵盖的核素库后再匹配",
+        help="标准样品源证书（txt/csv/docx/xlsx/pdf），自动收缩为证书涵盖的核素库",
+    )
+    parser.add_argument(
+        "--decay-to",
+        help="把证书活度校正到该日期（YYYY-MM-DD）；分析谱时默认取谱的测量日期",
     )
     parser.add_argument("--write-library", help="把最终使用的核素库写成 JSON，便于复用")
     parser.add_argument("--snip-iterations", type=int, help="SNIP 本底迭代次数")
@@ -87,11 +91,12 @@ def convert_certificate(
     certificate_path: str,
     base_library_path: str | None = None,
     output_path: str | None = None,
+    target_date: str | None = None,
 ) -> dict:
     """Turn a certificate into a nuclide library without analysing a spectrum."""
 
     base = load_nuclide_library(base_library_path) if base_library_path else NNDC_LIBRARY
-    result = certificate_library_from_text(_read_text_file(certificate_path), base)
+    result = certificate_library_from_file(certificate_path, base, target_date=target_date)
     payload = {
         "certificate": Path(certificate_path).name,
         "entries": [
@@ -99,6 +104,8 @@ def convert_certificate(
                 "label": entry.label,
                 "nuclide": entry.nuclide,
                 "activity_bq_per_kg": entry.activity_bq_per_kg,
+                "decay_factor": round(entry.decay_factor, 6),
+                "activity_corrected_bq_per_kg": round(entry.corrected_bq_per_kg(), 6),
                 "uncertainty": entry.uncertainty,
                 "proxies": entry.proxies,
                 "activity_bq": entry.activity_bq(result.certificate.mass_kg),
@@ -106,6 +113,7 @@ def convert_certificate(
             for entry in result.certificate.entries
         ],
         "reference_date": result.certificate.reference_date,
+        "target_date": result.target_date,
         "mass_kg": result.certificate.mass_kg,
         "nuclides": result.nuclides,
         "line_count": result.line_count,
@@ -134,6 +142,7 @@ def analyze_file(
     allow_unverified: bool = False,
     certificate_path: str | None = None,
     write_library: str | None = None,
+    decay_to: str | None = None,
 ) -> dict:
     record = load_spectrum_file(path)
     background = load_spectrum_file(background_path) if background_path else None
@@ -141,17 +150,23 @@ def analyze_file(
     certificate_payload = None
     library = base_library
     if certificate_path:
-        certificate_result = certificate_library_from_text(_read_text_file(certificate_path), base_library)
+        target_date = decay_to or record.measurement_date
+        certificate_result = certificate_library_from_file(
+            certificate_path, base_library, target_date=target_date
+        )
         library = certificate_result.library
         certificate_payload = {
             "file": Path(certificate_path).name,
             "reference_date": certificate_result.certificate.reference_date,
+            "target_date": certificate_result.target_date,
             "mass_kg": certificate_result.certificate.mass_kg,
             "entries": [
                 {
                     "label": entry.label,
                     "nuclide": entry.nuclide,
                     "activity_bq_per_kg": entry.activity_bq_per_kg,
+                    "decay_factor": round(entry.decay_factor, 6),
+                    "activity_corrected_bq_per_kg": round(entry.corrected_bq_per_kg(), 6),
                     "proxies": entry.proxies,
                 }
                 for entry in certificate_result.certificate.entries
@@ -320,7 +335,9 @@ def main() -> None:
         if not (args.certificate and args.write_library):
             parser.error("需要提供谱文件；只做证书转换时请同时给出 --certificate 与 --write-library")
         try:
-            payload = convert_certificate(args.certificate, args.library, args.write_library)
+            payload = convert_certificate(
+                args.certificate, args.library, args.write_library, args.decay_to
+            )
         except ValueError as exc:
             parser.error(str(exc))
         print(json.dumps(payload, ensure_ascii=False, indent=2))
@@ -352,6 +369,7 @@ def main() -> None:
             allow_unverified=args.allow_unverified_calibration,
             certificate_path=args.certificate,
             write_library=args.write_library,
+            decay_to=args.decay_to,
         )
     except ValueError as exc:
         parser.error(str(exc))

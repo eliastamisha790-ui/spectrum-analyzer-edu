@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 
 import numpy as np
@@ -31,9 +32,11 @@ from spectrum_analyzer.core import (
     summarize_nuclide_matches,
 )
 from spectrum_analyzer.certificate import (
+    certificate_library_from_file,
     certificate_library_from_text,
     normalize_nuclide,
     parse_certificate_text,
+    read_certificate_file,
 )
 from spectrum_analyzer.demo import (
     DEMO_OFFSET_KEV,
@@ -585,6 +588,63 @@ class CertificateTests(unittest.TestCase):
         entry = next(item for item in certificate.entries if item.nuclide == "cs-137")
         self.assertAlmostEqual(entry.activity_bq(certificate.mass_kg), 24.3, places=6)
         self.assertIsNone(entry.activity_bq(None))
+
+    def test_reference_date_prefers_the_certification_line(self) -> None:
+        text = (
+            "标样测量日期2022年11月11日\n"
+            "238U：158 Bq/kg\n"
+            "检定时间1995年1月31日\n"
+        )
+        certificate = parse_certificate_text(text)
+        self.assertEqual(certificate.reference_date, "1995-01-31")
+
+    def test_decay_correction_matches_hand_calculation(self) -> None:
+        text = "60Co：137 Bq/kg\n137Cs：81 Bq/kg\n检定时间：1995-01-31\n"
+        result = certificate_library_from_text(text, NNDC_LIBRARY, target_date="2022-11-11")
+        entries = {entry.nuclide: entry for entry in result.certificate.entries}
+        self.assertAlmostEqual(entries["co-60"].decay_factor, 0.0259, places=3)
+        self.assertAlmostEqual(entries["cs-137"].decay_factor, 0.527, places=3)
+        self.assertAlmostEqual(entries["co-60"].corrected_bq_per_kg(), 3.55, places=1)
+        self.assertAlmostEqual(entries["cs-137"].corrected_bq_per_kg(), 42.7, places=1)
+        self.assertIn("衰减系数", result.summary_text())
+
+    def test_docx_certificate_is_read_without_extra_dependencies(self) -> None:
+        document = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>'
+            "<w:p><w:r><w:t>标准样品源总重300g</w:t></w:r></w:p>"
+            "<w:p><w:r><w:t>238U：158 Bq/kg</w:t></w:r></w:p>"
+            "<w:p><w:r><w:t>137Cs：81 Bq/kg</w:t></w:r></w:p>"
+            "<w:p><w:r><w:t>检定时间1995年1月31日</w:t></w:r></w:p>"
+            "</w:body></w:document>"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "cert.docx"
+            with zipfile.ZipFile(path, "w") as archive:
+                archive.writestr("word/document.xml", document)
+            result = certificate_library_from_file(str(path), NNDC_LIBRARY)
+        self.assertEqual(len(result.certificate.entries), 2)
+        self.assertEqual(result.certificate.reference_date, "1995-01-31")
+        self.assertAlmostEqual(result.certificate.mass_kg, 0.3)
+        self.assertIn("th-234", result.nuclides)
+
+    def test_image_certificate_explains_the_ocr_limitation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "label.jpg"
+            path.write_bytes(b"\xff\xd8\xff\xe0JFIF")
+            with self.assertRaisesRegex(ValueError, "OCR"):
+                read_certificate_file(str(path))
+
+    def test_spe_measurement_date_is_captured(self) -> None:
+        content = (
+            "$SPEC_ID:\ntest\n$DATE_MEA:\n11/11/2022 22:10:26\n"
+            "$MEAS_TIM:\n100 110\n$DATA:\n0 3\n1\n2\n3\n4\n"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "dated.spe"
+            path.write_text(content, encoding="utf-8")
+            record = load_spectrum_file(str(path))
+        self.assertEqual(record.measurement_date, "2022-11-11")
 
 
 if __name__ == "__main__":
