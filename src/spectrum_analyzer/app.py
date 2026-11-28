@@ -1162,6 +1162,7 @@ class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
             certificate,
             live_time,
             self.nuclide_library,
+            target_date=self.current_spectrum.measurement_date,
         )
         if result.model is None:
             QtWidgets.QMessageBox.warning(self, "效率刻度", result.note or "未能建立效率曲线。")

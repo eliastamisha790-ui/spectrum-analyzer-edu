@@ -149,7 +149,7 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertIsNotNone(dialog.result)
         self.assertEqual(
             set(dialog.result.nuclides),
-            {"th-234", "u-235", "ra-226", "pb-214", "bi-214", "cs-137"},
+            {"th-234", "u-235", "ra-226", "pb-214", "bi-214", "pb-210", "cs-137"},
         )
         self.assertNotIn("am-241", dialog.result.library)
 

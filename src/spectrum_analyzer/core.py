@@ -29,7 +29,7 @@ XLSX_MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 XLSX_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 XLSX_PKG_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
 SPECTRUM_FILE_FILTER = (
-    "支持的谱文件 (*.spe *.Spe *.SPE *.xlsx *.XLSX *.csv *.CSV *.txt *.TXT);;"
+    "支持的谱文件 (*.spe *.Spe *.SPE *.spc *.SPC *.xlsx *.XLSX *.csv *.CSV *.txt *.TXT);;"
     "Canberra SPE (*.spe *.Spe *.SPE);;"
     "Excel 工作簿 (*.xlsx *.XLSX);;"
     "文本数据 (*.csv *.CSV *.txt *.TXT);;"
@@ -1584,15 +1584,99 @@ def parse_delimited_file(filepath: str) -> SpectrumRecord:
     return parsed
 
 
+def parse_spc_file(filepath: str) -> SpectrumRecord:
+    """Read a GammaVision/ORTEC ``.spc`` binary spectrum.
+
+    Layout used by GammaVision 6: a 7680-byte ASCII header followed by one
+    little-endian uint32 per channel. The header carries the measurement date,
+    live/real time and the detector description; the counts are identical to the
+    ``.spe`` text export of the same measurement.
+    """
+
+    raw = Path(filepath).read_bytes()
+    offset = 7680
+    if len(raw) <= offset or (len(raw) - offset) % 4 != 0:
+        # 退化处理：找 4 字节对齐、通道数为 2 的幂的偏移
+        resolved = None
+        for candidate in range(0, min(len(raw), 16384), 4):
+            channels = (len(raw) - candidate) // 4
+            if channels in (1024, 2048, 4096, 8192, 16384, 32768):
+                resolved = candidate if resolved is None else resolved
+                break
+        if resolved is None:
+            raise ValueError("无法识别该 SPC 文件的数据区偏移（不是 GammaVision 谱文件？）。")
+        offset = resolved
+    channel_count = (len(raw) - offset) // 4
+    if channel_count < 4:
+        raise ValueError("SPC 文件中的数据点不足。")
+    counts = np.frombuffer(raw, dtype="<u4", count=channel_count, offset=offset).astype(float)
+    header = raw[:offset].decode("latin-1", errors="ignore")
+    live_time, real_time = _spc_times(header)
+    measurement_date = _spc_date(header)
+    return _validated_record(
+        SpectrumRecord(
+            filepath=filepath,
+            channels=np.arange(channel_count, dtype=float),
+            counts=counts,
+            real_time=real_time,
+            live_time=live_time,
+            measurement_date=measurement_date,
+        )
+    )
+
+
+_MONTHS = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+
+
+def _spc_date(header: str) -> Optional[str]:
+    match = re.search(r"(\d{1,2})-([A-Za-z]{3})-(\d{2,4})", header)
+    if not match:
+        return None
+    day, month_name, year_text = match.groups()
+    month = _MONTHS.get(month_name.lower())
+    if month is None:
+        return None
+    # GammaVision 的日期字段是定宽写死的，年份后可能粘着一位别的数字（如
+    # “11-Nov-221”），取前两位才能得到真正的年份
+    if len(year_text) == 3:
+        year_text = year_text[:2]
+    year = int(year_text)
+    if year < 100:
+        year += 2000 if year < 70 else 1900
+    return f"{year:04d}-{month:02d}-{int(day):02d}"
+
+
+def _spc_times(header: str) -> Tuple[Optional[float], Optional[float]]:
+    """Live time then real time, as written next to the measurement date."""
+
+    match = re.search(r"\d{1,2}-[A-Za-z]{3}-\d{2,4}\D{0,20}\d{2}:\d{2}:\d{2}\s+(\d{4,8})\s+(\d{4,8})", header)
+    if not match:
+        match = re.search(r"(\d{4,8})\s+(\d{4,8})", header)
+    if not match:
+        return None, None
+    try:
+        live, real = float(match.group(1)), float(match.group(2))
+    except ValueError:
+        return None, None
+    if live <= 0 or real <= 0:
+        return None, None
+    return live, real
+
+
 def load_spectrum_file(filepath: str) -> SpectrumRecord:
     extension = os.path.splitext(filepath)[1].lower()
     if extension == ".spe":
         return parse_spe_file(filepath)
+    if extension == ".spc":
+        return parse_spc_file(filepath)
     if extension == ".xlsx":
         return parse_xlsx_file(filepath)
     if extension in {".csv", ".txt"}:
         return parse_delimited_file(filepath)
-    raise ValueError("暂不支持该文件类型，请选择 SPE、XLSX、CSV 或 TXT 文件。")
+    raise ValueError("暂不支持该文件类型，请选择 SPE、SPC、XLSX、CSV 或 TXT 文件。")
 
 
 def subtract_background(

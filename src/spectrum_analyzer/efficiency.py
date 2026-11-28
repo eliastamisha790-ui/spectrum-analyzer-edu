@@ -14,7 +14,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from .certificate import Certificate
+from .certificate import Certificate, apply_decay_correction
 from .core import EfficiencyModel, PeakResult
 
 
@@ -95,6 +95,7 @@ def build_efficiency_from_certificate(
     exclude_isotopes: Optional[List[str]] = None,
     min_points: int = 3,
     max_relative_residual: float = 0.30,
+    target_date: Optional[str] = None,
 ) -> EfficiencyCalibrationResult:
     """One efficiency point per certified line that has a clean peak.
 
@@ -108,6 +109,9 @@ def build_efficiency_from_certificate(
 
     if not live_time or live_time <= 0:
         return EfficiencyCalibrationResult(model=None, note="缺少活时间，无法把峰面积换算成计数率。")
+    # 用测量日期再校一次衰变：证书缓存可能来自早期版本（未校正），不能默认它已经算过
+    if target_date:
+        apply_decay_correction(certificate, target_date)
     activity_map = _proxy_activity_map(certificate)
     if not activity_map:
         return EfficiencyCalibrationResult(model=None, note="证书没有可用的核素活度。")
@@ -121,6 +125,11 @@ def build_efficiency_from_certificate(
             continue
         if peak.is_ambiguous:
             skipped.append(f"{peak.energy:.1f} keV（双线，归属不唯一）")
+            continue
+        if peak.area_uncertainty <= 0:
+            # 面积为窗口求和（高斯拟合未通过）——这类“虚胖”面积会系统性抬高
+            # 低能端效率，直接排除比事后剔除更可靠
+            skipped.append(f"{peak.energy:.1f} keV（面积未通过高斯拟合，无不确定度）")
             continue
         activity = activity_map.get(isotope)
         if not activity or activity <= 0:

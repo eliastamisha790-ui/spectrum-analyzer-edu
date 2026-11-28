@@ -255,6 +255,7 @@ def analyze_file(
             certificate_object,
             live_time,
             library,
+            target_date=record.measurement_date,
         )
         if efficiency_result.model is not None:
             efficiency_payload = {

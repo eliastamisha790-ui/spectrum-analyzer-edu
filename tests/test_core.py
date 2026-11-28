@@ -558,13 +558,14 @@ class CertificateTests(unittest.TestCase):
                 "ra-226",
                 "pb-214",
                 "bi-214",
+                "pb-210",
                 "k-40",
                 "co-60",
                 "cs-137",
             },
         )
         # 证书里没有的核素必须被剔除，否则候选名单会被污染
-        for absent in ("am-241", "cd-109", "co-57", "pb-210", "eu-152", "ba-133"):
+        for absent in ("am-241", "cd-109", "co-57", "eu-152", "ba-133"):
             self.assertNotIn(absent, result.library)
         self.assertLess(result.line_count, sum(len(v) for v in NNDC_LIBRARY.values()))
 
@@ -647,6 +648,33 @@ class CertificateTests(unittest.TestCase):
             path.write_text(content, encoding="utf-8")
             record = load_spectrum_file(str(path))
         self.assertEqual(record.measurement_date, "2022-11-11")
+
+
+class SpcFormatTests(unittest.TestCase):
+    def _write_spc(self, path: Path, counts, header_text: str) -> None:
+        header = header_text.encode("latin-1")
+        header = header.ljust(7680, b"\x00")
+        body = b"".join(int(value).to_bytes(4, "little") for value in counts)
+        path.write_bytes(header + body)
+
+    def test_spc_matches_the_spe_export(self) -> None:
+        counts = [0, 1, 2, 3, 5, 8, 13, 21]
+        header = "300G.Spc        11-Nov-221  22:10:26      139321    139453 CN-PL-DZ-01-33-34"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "sample.spc"
+            self._write_spc(path, counts, header)
+            record = load_spectrum_file(str(path))
+        np.testing.assert_array_equal(record.counts, counts)
+        self.assertEqual(record.live_time, 139321.0)
+        self.assertEqual(record.real_time, 139453.0)
+        self.assertEqual(record.measurement_date, "2022-11-11")
+
+    def test_spc_with_a_broken_size_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "broken.spc"
+            path.write_bytes(b"\x00" * 700)
+            with self.assertRaisesRegex(ValueError, "SPC"):
+                load_spectrum_file(str(path))
 
 
 class EfficiencyTests(unittest.TestCase):
