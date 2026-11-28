@@ -134,5 +134,33 @@ class GuiSmokeTests(unittest.TestCase):
         app.processEvents()
 
 
+    def test_certificate_dialog_narrows_the_library(self) -> None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+        from PyQt5 import QtWidgets
+
+        from spectrum_analyzer.app import CertificateLibraryDialog, SpectrumAnalyzerApp
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        window = SpectrumAnalyzerApp()
+        dialog = CertificateLibraryDialog(window, window.nuclide_library)
+        dialog.editor.setPlainText("238U：158\n226Ra：132\n137Cs：81\n")
+
+        self.assertIsNotNone(dialog.result)
+        self.assertEqual(
+            set(dialog.result.nuclides),
+            {"th-234", "u-235", "ra-226", "pb-214", "bi-214", "cs-137"},
+        )
+        self.assertNotIn("am-241", dialog.result.library)
+
+        dialog.editor.setPlainText("这段文字没有核素")
+        self.assertIsNone(dialog.result)
+        self.assertIn("没有从文本中识别出任何核素", dialog.preview.text())
+
+        dialog.close()
+        window.close()
+        app.processEvents()
+
+
 if __name__ == "__main__":
     unittest.main()

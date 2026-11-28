@@ -30,6 +30,11 @@ from spectrum_analyzer.core import (
     subtract_background,
     summarize_nuclide_matches,
 )
+from spectrum_analyzer.certificate import (
+    certificate_library_from_text,
+    normalize_nuclide,
+    parse_certificate_text,
+)
 from spectrum_analyzer.demo import (
     DEMO_OFFSET_KEV,
     DEMO_SLOPE_KEV_PER_CHANNEL,
@@ -502,6 +507,84 @@ class AutoCalibrationTests(unittest.TestCase):
         slope, offset = result.model.coefficients
         self.assertAlmostEqual(slope, DOUBLET_SLOPE_KEV_PER_CHANNEL, delta=0.0005)
         self.assertAlmostEqual(offset, DOUBLET_OFFSET_KEV, delta=0.15)
+
+
+class CertificateTests(unittest.TestCase):
+    TEXT = """标准源：GBW08304a（300g）
+核素比活度 (Bq/kg)
+238U：158
+232Th：65.6
+226Ra：132
+40K：535
+60Co：137
+137Cs：81
+定值时间：1995年1月31日
+"""
+
+    def test_parses_certificate_entries_units_and_metadata(self) -> None:
+        certificate = parse_certificate_text(self.TEXT)
+        self.assertEqual(len(certificate.entries), 6)
+        by_nuclide = {entry.nuclide: entry for entry in certificate.entries}
+        self.assertAlmostEqual(by_nuclide["u-238"].activity_bq_per_kg, 158.0)
+        self.assertAlmostEqual(by_nuclide["th-232"].activity_bq_per_kg, 65.6)
+        self.assertAlmostEqual(by_nuclide["cs-137"].activity_bq_per_kg, 81.0)
+        self.assertEqual(certificate.reference_date, "1995-01-31")
+        self.assertAlmostEqual(certificate.mass_kg, 0.3)
+
+    def test_nuclide_label_normalisation(self) -> None:
+        self.assertEqual(normalize_nuclide("238U"), "u-238")
+        self.assertEqual(normalize_nuclide("U-238"), "u-238")
+        self.assertEqual(normalize_nuclide("Cs-137"), "cs-137")
+        self.assertEqual(normalize_nuclide("137Cs"), "cs-137")
+        self.assertEqual(normalize_nuclide("K40"), "k-40")
+        self.assertIsNone(normalize_nuclide("abc"))
+
+    def test_daughters_replace_parents_and_drop_unrelated_nuclides(self) -> None:
+        result = certificate_library_from_text(self.TEXT, NNDC_LIBRARY)
+        self.assertEqual(
+            set(result.nuclides),
+            {
+                "th-234",
+                "u-235",
+                "ac-228",
+                "pb-212",
+                "tl-208",
+                "bi-212",
+                "ra-226",
+                "pb-214",
+                "bi-214",
+                "k-40",
+                "co-60",
+                "cs-137",
+            },
+        )
+        # 证书里没有的核素必须被剔除，否则候选名单会被污染
+        for absent in ("am-241", "cd-109", "co-57", "pb-210", "eu-152", "ba-133"):
+            self.assertNotIn(absent, result.library)
+        self.assertLess(result.line_count, sum(len(v) for v in NNDC_LIBRARY.values()))
+
+    def test_every_kept_line_comes_from_the_base_library(self) -> None:
+        result = certificate_library_from_text(self.TEXT, NNDC_LIBRARY)
+        for isotope, lines in result.library.items():
+            self.assertEqual(lines, NNDC_LIBRARY[isotope])
+            for line in lines:
+                self.assertGreater(line["energy"], 0)
+                self.assertGreater(line["intensity"], 0)
+
+    def test_unknown_nuclide_is_reported_instead_of_silently_dropped(self) -> None:
+        result = certificate_library_from_text("238U：158\nTc-99：12\n", NNDC_LIBRARY)
+        self.assertIn("tc-99", result.missing_proxies)
+        self.assertIn("th-234", result.nuclides)
+
+    def test_text_without_nuclides_raises(self) -> None:
+        with self.assertRaisesRegex(ValueError, "没有从文本中识别出任何核素"):
+            parse_certificate_text("这是一段没有任何核素的说明文字")
+
+    def test_activity_is_scaled_by_certificate_mass(self) -> None:
+        certificate = parse_certificate_text(self.TEXT)
+        entry = next(item for item in certificate.entries if item.nuclide == "cs-137")
+        self.assertAlmostEqual(entry.activity_bq(certificate.mass_kg), 24.3, places=6)
+        self.assertIsNone(entry.activity_bq(None))
 
 
 if __name__ == "__main__":

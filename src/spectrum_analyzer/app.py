@@ -46,11 +46,74 @@ from .core import (
     validate_nuclide_library,
 )
 from .demo import DEMO_OFFSET_KEV, DEMO_SLOPE_KEV_PER_CHANNEL, synthetic_co60_record
+from .certificate import certificate_library_from_text
 
 APP_DATA_DIR = Path(os.environ.get("SPECTRUM_ANALYZER_DATA_DIR", Path.home() / ".spectrum-analyzer"))
 REPORT_DIR = str(APP_DATA_DIR / "reports")
+LIBRARY_DIR = str(APP_DATA_DIR / "libraries")
 EFFICIENCY_CACHE_PATH = str(APP_DATA_DIR / "efficiency_model.json")
 BASE_DIR = str(Path(__file__).resolve().parent)
+
+CERTIFICATE_TEMPLATE = """标准源：GBW08304a（300g）
+核素比活度 (Bq/kg)
+238U：158
+232Th：65.6
+226Ra：132
+40K：535
+60Co：137
+137Cs：81
+定值时间：1995年1月31日
+"""
+
+
+class CertificateLibraryDialog(QtWidgets.QDialog):
+    def __init__(self, parent: QtWidgets.QWidget, base_library: Dict[str, List[Dict[str, float]]]) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("从证书生成核素库")
+        self.setModal(True)
+        self.resize(760, 560)
+        self.base_library = base_library
+        self.result = None
+        layout = QtWidgets.QVBoxLayout(self)
+        tip = QtWidgets.QLabel(
+            "把证书上的核素与比活度粘贴到下面（一行一个，兼容“238U：158 Bq/kg”“Cs-137 81”等写法）。\n"
+            "软件只保留证书能解释的谱线，并按子体展开：238U→234Th/235U，232Th→228Ac/212Pb/208Tl，226Ra→186 keV/214Pb/214Bi。"
+        )
+        tip.setWordWrap(True)
+        layout.addWidget(tip)
+        self.editor = QtWidgets.QPlainTextEdit(CERTIFICATE_TEMPLATE)
+        self.editor.setFont(QtGui.QFont("Consolas", 10))
+        layout.addWidget(self.editor, 1)
+        self.preview = QtWidgets.QLabel()
+        self.preview.setWordWrap(True)
+        self.preview.setAlignment(QtCore.Qt.AlignTop)
+        layout.addWidget(self.preview, 1)
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
+        )
+        buttons.button(QtWidgets.QDialogButtonBox.Ok).setText("生成并应用")
+        buttons.button(QtWidgets.QDialogButtonBox.Cancel).setText("取消")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.editor.textChanged.connect(self._refresh_preview)
+        self._refresh_preview()
+
+    def _refresh_preview(self) -> None:
+        try:
+            self.result = certificate_library_from_text(self.editor.toPlainText(), self.base_library)
+        except ValueError as exc:
+            self.result = None
+            self.preview.setText(f"⚠ {exc}")
+            return
+        self.preview.setText(self.result.summary_text())
+
+    def accept(self) -> None:
+        if self.result is None:
+            QtWidgets.QMessageBox.warning(self, "无法生成", "证书内容还不能解析出核素，请检查格式。")
+            return
+        super().accept()
+
 
 class CalibrationDialog(QtWidgets.QDialog):
     def __init__(self, parent: QtWidgets.QWidget, isotopes: List[str]) -> None:
@@ -475,7 +538,7 @@ class AxisLockedViewBox(pg.ViewBox):
 class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("能谱分析工作台 v0.6")
+        self.setWindowTitle("能谱分析工作台 v0.7")
         self.resize(1280, 760)
         self.current_spectrum: Optional[SpectrumRecord] = None
         self.background_spectrum: Optional[SpectrumRecord] = None
@@ -725,6 +788,7 @@ class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
         configuration_menu.addSeparator()
         self.import_library_action = configuration_menu.addAction("导入核素库…")
         self.restore_library_action = configuration_menu.addAction("恢复内置教学库")
+        self.certificate_library_action = configuration_menu.addAction("从证书生成核素库…")
         configuration_menu.addSeparator()
         self.import_background_action = configuration_menu.addAction("导入实测本底谱…")
         self.clear_background_action = configuration_menu.addAction("移除本底谱")
@@ -752,6 +816,7 @@ class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
         self.analysis_settings_action.triggered.connect(self.open_analysis_settings_dialog)
         self.import_library_action.triggered.connect(self.import_nuclide_library)
         self.restore_library_action.triggered.connect(self.restore_builtin_library)
+        self.certificate_library_action.triggered.connect(self.import_certificate_library)
         self.import_background_action.triggered.connect(self.import_background_spectrum)
         self.clear_background_action.triggered.connect(self.clear_background_spectrum)
         self.snip_after_background_action.toggled.connect(self._handle_background_snip_toggled)
@@ -970,6 +1035,36 @@ class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
         self._rematch_current_peaks()
         self._update_info_label()
         self.statusBar().showMessage("已恢复内置教学核素库")
+
+    def import_certificate_library(self) -> None:
+        """Narrow the library down to what the standard source certificate covers."""
+
+        dialog = CertificateLibraryDialog(self, self.nuclide_library)
+        if dialog.exec_() != QtWidgets.QDialog.Accepted or dialog.result is None:
+            return
+        result = dialog.result
+        self.nuclide_library = validate_nuclide_library(result.library)
+        self.flat_library = flatten_library(self.nuclide_library)
+        self.library_source = f"证书 {len(self.nuclide_library)} 种核素"
+        ensure_directory(LIBRARY_DIR)
+        library_path = os.path.join(LIBRARY_DIR, "certificate-library.json")
+        try:
+            with open(library_path, "w", encoding="utf-8") as handle:
+                json.dump(self.nuclide_library, handle, ensure_ascii=False, indent=2)
+            with open(os.path.join(LIBRARY_DIR, "certificate.txt"), "w", encoding="utf-8") as handle:
+                handle.write(dialog.editor.toPlainText())
+        except OSError as exc:
+            QtWidgets.QMessageBox.warning(self, "保存失败", f"核素库已应用，但保存到磁盘失败：{exc}")
+        self._rematch_current_peaks()
+        self._update_info_label()
+        self.statusBar().showMessage(
+            f"已按证书收缩核素库：{len(self.nuclide_library)} 种核素 / {len(self.flat_library)} 条参考线"
+        )
+        QtWidgets.QMessageBox.information(
+            self,
+            "证书核素库",
+            result.summary_text() + f"\n\n已保存：{library_path}\n（可用“配置 → 恢复内置教学库”还原）",
+        )
 
     def open_manual_calibration_dialog(self) -> None:
         dialog = ManualCalibrationDialog(self)

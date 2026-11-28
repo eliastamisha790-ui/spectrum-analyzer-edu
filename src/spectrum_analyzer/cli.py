@@ -14,7 +14,9 @@ from .core import (
     auto_calibrate,
     load_nuclide_library,
     load_spectrum_file,
+    validate_nuclide_library,
 )
+from .certificate import certificate_library_from_text
 
 
 def parse_widths(value: str) -> tuple[int, ...]:
@@ -29,7 +31,7 @@ def parse_widths(value: str) -> tuple[int, ...]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="教学用途的伽马能谱分析命令行工具")
-    parser.add_argument("spectrum", help="SPE、XLSX、CSV 或 TXT 谱文件")
+    parser.add_argument("spectrum", nargs="?", help="SPE、XLSX、CSV 或 TXT 谱文件")
     parser.add_argument("--slope", type=float, default=1.0, help="线性能量刻度斜率，keV/channel")
     parser.add_argument("--offset", type=float, default=0.0, help="线性能量刻度截距，keV")
     parser.add_argument(
@@ -43,6 +45,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="自动刻度未通过可信度检查时仍然采用（默认改为报错退出）",
     )
     parser.add_argument("--library", help="自定义核素参考库（JSON 或 CSV）")
+    parser.add_argument(
+        "--certificate",
+        help="标准样品源证书（纯文本），自动收缩为证书涵盖的核素库后再匹配",
+    )
+    parser.add_argument("--write-library", help="把最终使用的核素库写成 JSON，便于复用")
     parser.add_argument("--snip-iterations", type=int, help="SNIP 本底迭代次数")
     parser.add_argument("--widths", type=parse_widths, default=(2, 4, 6, 8, 10, 12), help="小波宽度，如 2,4,6,8")
     parser.add_argument("--threshold-sigma", type=float, default=1.0, help="寻峰阈值系数")
@@ -65,6 +72,57 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _read_text_file(path: str) -> str:
+    for encoding in ("utf-8-sig", "gb18030"):
+        try:
+            return Path(path).read_text(encoding=encoding)
+        except UnicodeDecodeError:
+            continue
+        except OSError as exc:
+            raise ValueError(f"无法读取文件：{exc}") from exc
+    raise ValueError("文件编码无法识别，请使用 UTF-8 或 GB18030。")
+
+
+def convert_certificate(
+    certificate_path: str,
+    base_library_path: str | None = None,
+    output_path: str | None = None,
+) -> dict:
+    """Turn a certificate into a nuclide library without analysing a spectrum."""
+
+    base = load_nuclide_library(base_library_path) if base_library_path else NNDC_LIBRARY
+    result = certificate_library_from_text(_read_text_file(certificate_path), base)
+    payload = {
+        "certificate": Path(certificate_path).name,
+        "entries": [
+            {
+                "label": entry.label,
+                "nuclide": entry.nuclide,
+                "activity_bq_per_kg": entry.activity_bq_per_kg,
+                "uncertainty": entry.uncertainty,
+                "proxies": entry.proxies,
+                "activity_bq": entry.activity_bq(result.certificate.mass_kg),
+            }
+            for entry in result.certificate.entries
+        ],
+        "reference_date": result.certificate.reference_date,
+        "mass_kg": result.certificate.mass_kg,
+        "nuclides": result.nuclides,
+        "line_count": result.line_count,
+        "missing_proxies": sorted(set(result.missing_proxies)),
+        "library": result.library,
+    }
+    if output_path:
+        destination = Path(output_path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(
+            json.dumps(validate_nuclide_library(result.library), ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        payload["written_to"] = str(destination.resolve())
+    return payload
+
+
 def analyze_file(
     path: str,
     slope: float,
@@ -74,10 +132,39 @@ def analyze_file(
     background_path: str | None = None,
     auto_calibrate_enabled: bool = False,
     allow_unverified: bool = False,
+    certificate_path: str | None = None,
+    write_library: str | None = None,
 ) -> dict:
     record = load_spectrum_file(path)
     background = load_spectrum_file(background_path) if background_path else None
-    library = load_nuclide_library(library_path) if library_path else NNDC_LIBRARY
+    base_library = load_nuclide_library(library_path) if library_path else NNDC_LIBRARY
+    certificate_payload = None
+    library = base_library
+    if certificate_path:
+        certificate_result = certificate_library_from_text(_read_text_file(certificate_path), base_library)
+        library = certificate_result.library
+        certificate_payload = {
+            "file": Path(certificate_path).name,
+            "reference_date": certificate_result.certificate.reference_date,
+            "mass_kg": certificate_result.certificate.mass_kg,
+            "entries": [
+                {
+                    "label": entry.label,
+                    "nuclide": entry.nuclide,
+                    "activity_bq_per_kg": entry.activity_bq_per_kg,
+                    "proxies": entry.proxies,
+                }
+                for entry in certificate_result.certificate.entries
+            ],
+            "missing_proxies": sorted(set(certificate_result.missing_proxies)),
+        }
+    if write_library:
+        destination = Path(write_library)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(
+            json.dumps(validate_nuclide_library(library), ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
     settings = (config or AnalysisConfig()).validated()
 
     auto_payload = None
@@ -144,7 +231,13 @@ def analyze_file(
             "source": "auto" if auto_payload else "manual",
             "auto": auto_payload,
         },
-        "reference_library": Path(library_path).name if library_path else "built-in-teaching-library",
+        "reference_library": (
+            f"certificate:{Path(certificate_path).name}"
+            if certificate_path
+            else (Path(library_path).name if library_path else "built-in-teaching-library")
+        ),
+        "certificate": certificate_payload,
+        "library_nuclides": sorted(library),
         "analysis_config": settings.as_dict(),
         "nuclide_summary": [
             {
@@ -221,6 +314,18 @@ def analyze_file(
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+
+    # 只做证书转换：不提供谱文件，但要给出 --certificate 与 --write-library
+    if not getattr(args, "spectrum", None):
+        if not (args.certificate and args.write_library):
+            parser.error("需要提供谱文件；只做证书转换时请同时给出 --certificate 与 --write-library")
+        try:
+            payload = convert_certificate(args.certificate, args.library, args.write_library)
+        except ValueError as exc:
+            parser.error(str(exc))
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
+
     config = AnalysisConfig(
         snip_iterations=args.snip_iterations,
         wavelet_widths=args.widths,
@@ -245,6 +350,8 @@ def main() -> None:
             background_path=args.background,
             auto_calibrate_enabled=args.auto_calibrate,
             allow_unverified=args.allow_unverified_calibration,
+            certificate_path=args.certificate,
+            write_library=args.write_library,
         )
     except ValueError as exc:
         parser.error(str(exc))
