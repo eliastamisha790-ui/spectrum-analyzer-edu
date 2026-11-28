@@ -588,7 +588,7 @@ class AxisLockedViewBox(pg.ViewBox):
 class SpectrumAnalyzerApp(QtWidgets.QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("能谱分析工作台 v0.9")
+        self.setWindowTitle("能谱分析工作台 v0.10")
         self.resize(1280, 760)
         self.current_spectrum: Optional[SpectrumRecord] = None
         self.background_spectrum: Optional[SpectrumRecord] = None
